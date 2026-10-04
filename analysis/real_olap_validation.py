@@ -288,7 +288,7 @@ def _build_table_outcome(
     )
 
     return OutcomeObservation(
-        target="REAL_OLAP",
+        target=target,
         prediction_date=prediction_date,
         data_cutoff_date=prediction_date,
         entry_mode=entry_mode,

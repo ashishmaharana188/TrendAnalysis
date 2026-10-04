@@ -58,6 +58,7 @@ class PanelBuildStats:
     valid_pairs: int
     skipped_missing_outcome: int
     skipped_cutoff_violation: int
+    skipped_identity_mismatch: int
     skipped_contract_violation: int
 
     @property
@@ -65,6 +66,7 @@ class PanelBuildStats:
         return (
             self.skipped_missing_outcome
             + self.skipped_cutoff_violation
+            + self.skipped_identity_mismatch
             + self.skipped_contract_violation
         )
 
@@ -74,6 +76,7 @@ class PanelBuildStats:
             "valid_pairs": self.valid_pairs,
             "skipped_missing_outcome": self.skipped_missing_outcome,
             "skipped_cutoff_violation": self.skipped_cutoff_violation,
+            "skipped_identity_mismatch": self.skipped_identity_mismatch,
             "skipped_contract_violation": self.skipped_contract_violation,
         }
 
@@ -293,6 +296,7 @@ def build_historical_state_outcome_panel(
 
     skipped_missing_outcome = 0
     skipped_cutoff_violation = 0
+    skipped_identity_mismatch = 0
     skipped_contract_violation = 0
 
     seen_snapshot_keys: set[tuple[str, date]] = set()
@@ -334,6 +338,13 @@ def build_historical_state_outcome_panel(
             snapshot,
             outcome,
         )
+
+        identity_violations = {
+            "State and outcome prediction dates do not match.",
+            "State and outcome targets do not match.",
+        }
+        if any(message in identity_violations for message in violations):
+            skipped_identity_mismatch += 1
 
         if violations:
             message = (
@@ -388,6 +399,7 @@ def build_historical_state_outcome_panel(
         valid_pairs=len(observations),
         skipped_missing_outcome=skipped_missing_outcome,
         skipped_cutoff_violation=skipped_cutoff_violation,
+        skipped_identity_mismatch=skipped_identity_mismatch,
         skipped_contract_violation=skipped_contract_violation,
     )
 

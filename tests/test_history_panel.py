@@ -111,6 +111,7 @@ def main() -> None:
 
     assert panel.stats.valid_pairs == 1
     assert panel.stats.skipped_cutoff_violation == 1
+    assert panel.stats.skipped_identity_mismatch == 0
     assert len(panel.observations) == 1
 
     row = panel.observations[0]
