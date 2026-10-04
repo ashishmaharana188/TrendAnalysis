@@ -6,12 +6,15 @@ from math import isfinite
 from typing import Any
 
 import pyarrow as pa
+import logging
+import time
 from dateutil.relativedelta import relativedelta
 
 from .history_panel import (
     HistoricalStateSnapshot,
     build_historical_state_outcome_panel,
 )
+from .performance import DailyHistoryCache, patch_group_state_history_loader
 from .relationship import (
     HistoricalRelationshipObservation,
     RelationshipDiscoveryEngine,
@@ -54,6 +57,25 @@ FINANCIAL_TIMING_LIMITED_FAMILIES = (
     "sector.financials",
 )
 
+# Domain classification taken from the existing upstream ETL fetch taxonomy.
+# These are global-context series, not company/industry relationship mappings.
+# They remain in the global family even though they physically live in
+# macro_daily_ledger in the current OLAP schema.
+UPSTREAM_GLOBAL_CONTEXT_SERIES = frozenset({
+    "US_10Y_Yield",
+    "Brent_Crude",
+    "USD_INR",
+    "US_Dollar_Index",
+    "Broad_Commodity",
+    "US_VIX",
+})
+
+TIME_SAFE_PHASE4_STATE_FAMILIES = tuple(
+    family
+    for family in EXPECTED_PHASE4_STATE_FAMILIES
+    if family not in FINANCIAL_TIMING_LIMITED_FAMILIES
+)
+
 
 @dataclass(frozen=True)
 class RealOLAPValidationConfig:
@@ -66,6 +88,9 @@ class RealOLAPValidationConfig:
     step_trading_days: int = 5
     min_training_observations: int = 12
     hardened_validation: bool = True
+    performance_cache: bool = True
+    progress_logging: bool = True
+    progress_every: int = 10
 
 
 @dataclass(frozen=True)
@@ -88,9 +113,11 @@ class RealOLAPValidationResult:
     latest_market_date: date | None
     first_prediction_date: date | None
     state_surface_coverage_pct: float = 0.0
+    time_safe_state_surface_coverage_pct: float = 0.0
     missing_state_families: tuple[str, ...] = ()
     timing_limited_state_families: tuple[str, ...] = ()
     broad_relationship_surface_validated: bool = False
+    time_safe_relationship_surface_validated: bool = False
     purged_training_observations: int = 0
     unknown_overlap_observations: int = 0
     selection_candidate_evaluations: int = 0
@@ -109,6 +136,25 @@ class RealOLAPValidationResult:
 
     def as_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
+
+
+_LOGGER = logging.getLogger("trendanalysis.phase4.real_olap")
+
+
+def _configure_progress_logging(enabled: bool) -> None:
+    if not enabled:
+        return
+    if not _LOGGER.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("[Phase 4] %(message)s"))
+        _LOGGER.addHandler(handler)
+    _LOGGER.setLevel(logging.INFO)
+    _LOGGER.propagate = False
+
+
+def _progress(enabled: bool, message: str, *args: Any) -> None:
+    if enabled:
+        _LOGGER.info(message, *args)
 
 
 def _as_date(value: str | date | datetime) -> date:
@@ -405,14 +451,19 @@ def _load_all_macro_histories(
     start_date: date,
     end_date: date,
     benchmark: str,
+    progress_logging: bool = True,
 ) -> dict[str, list[dict[str, Any]]]:
     from data_access.macro_global import get_macro_history, get_macro_indicators
 
     result: dict[str, list[dict[str, Any]]] = {}
-    for indicator in get_macro_indicators():
-        # The selected benchmark already gets its own benchmark family. Do not
-        # feed the same underlying series into macro a second time.
+    indicators = get_macro_indicators()
+    _progress(progress_logging, "Macro load start | indicators=%d", len(indicators))
+    for index, indicator in enumerate(indicators, start=1):
+        # The selected benchmark already gets its own benchmark family.
         if indicator == benchmark:
+            continue
+        # Global-context series are loaded separately into the global family.
+        if indicator in UPSTREAM_GLOBAL_CONTEXT_SERIES:
             continue
         rows = _table_rows(
             get_macro_history(
@@ -423,6 +474,8 @@ def _load_all_macro_histories(
         )
         if rows:
             result[indicator] = rows
+        if index == 1 or index % 10 == 0 or index == len(indicators):
+            _progress(progress_logging, "Macro load progress %d/%d | usable=%d", index, len(indicators), len(result))
     return result
 
 
@@ -431,22 +484,35 @@ def _load_global_histories(
     end_date: date,
     benchmark: str,
     target: str,
+    progress_logging: bool = True,
 ) -> dict[str, list[dict[str, Any]]]:
-    from data_access.macro_global import get_global_asset_history, get_global_assets
+    from data_access.macro_global import (
+        get_global_asset_history,
+        get_global_assets,
+        get_macro_history,
+        get_macro_indicators,
+    )
     from data_access.ticker import normalize_ticker
 
-    excluded = set(normalize_ticker(target)) | set(normalize_ticker(benchmark))
     result: dict[str, list[dict[str, Any]]] = {}
-    for asset in get_global_assets():
+
+    # 1. True non-equity rows in global_assets_daily.
+    excluded = set(normalize_ticker(target)) | set(normalize_ticker(benchmark))
+    assets = get_global_assets()
+    equity_candidates = 0
+    global_asset_candidates = 0
+    global_asset_rows = 0
+
+    _progress(progress_logging, "Global load start | global_assets_daily candidates=%d", len(assets))
+    for index, asset in enumerate(assets, start=1):
         ticker = str(asset.get("ticker", "")).strip()
         if not ticker or ticker in excluded:
             continue
         asset_class = str(asset.get("asset_class", "")).strip().lower()
-        # global_assets_daily also backs company equity history. Keep those
-        # out of the global-context family; otherwise arbitrary other stocks
-        # would silently enter the macro/global relationship graph.
         if asset_class in {"equity", "stock", "company", "share"}:
+            equity_candidates += 1
             continue
+        global_asset_candidates += 1
         rows = _table_rows(
             get_global_asset_history(
                 ticker,
@@ -456,6 +522,36 @@ def _load_global_histories(
         )
         if rows:
             result[ticker] = rows
+            global_asset_rows += 1
+        if index == 1 or index % 10 == 0 or index == len(assets):
+            _progress(
+                progress_logging,
+                "Global asset progress %d/%d | usable=%d equity_skipped=%d non_equity=%d",
+                index, len(assets), len(result), equity_candidates, global_asset_candidates,
+            )
+
+    # 2. Global-context series that upstream ETL stores in macro_daily_ledger.
+    indicators = get_macro_indicators()
+    macro_global_rows = 0
+    for indicator in indicators:
+        if indicator == benchmark or indicator not in UPSTREAM_GLOBAL_CONTEXT_SERIES:
+            continue
+        rows = _table_rows(
+            get_macro_history(
+                indicator,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        )
+        if rows:
+            result[indicator] = rows
+            macro_global_rows += 1
+
+    _progress(
+        progress_logging,
+        "Global load complete | usable_series=%d non_equity_assets=%d macro_global_series=%d | source_rows=%d+%d",
+        len(result), global_asset_rows, macro_global_rows, global_asset_candidates, macro_global_rows,
+    )
     return result
 
 
@@ -784,16 +880,40 @@ def build_real_olap_relationship_panel(
 
     industry, sector, industry_constituents, sector_constituents = _current_membership(config.ticker)
 
+    _configure_progress_logging(config.progress_logging)
+    run_start = time.perf_counter()
+    _progress(
+        config.progress_logging,
+        "Panel start | ticker=%s benchmark=%s timeframe=%s holding=%s | company_rows=%d",
+        config.ticker, config.benchmark, config.analysis_timeframe,
+        config.holding_period_months, len(company_rows),
+    )
+    _progress(
+        config.progress_logging,
+        "Membership | industry=%s (%d constituents) sector=%s (%d constituents)",
+        industry or "<none>", len(industry_constituents),
+        sector or "<none>", len(sector_constituents),
+    )
+
     macro_histories = _load_all_macro_histories(
         earliest_date,
         latest_market_date,
         config.benchmark,
+        progress_logging=config.progress_logging,
     )
     global_histories = _load_global_histories(
         earliest_date,
         latest_market_date,
         config.benchmark,
         config.ticker,
+        progress_logging=config.progress_logging,
+    )
+
+    _progress(
+        config.progress_logging,
+        "Context loaded | macro_series=%d global_series=%d | %.2fs elapsed",
+        len(macro_histories), len(global_histories),
+        time.perf_counter() - run_start,
     )
 
     dates = _prediction_dates(
@@ -815,78 +935,125 @@ def build_real_olap_relationship_panel(
 
     timeframe_months = TIMEFRAME_MONTHS[config.analysis_timeframe]
 
-    for prediction_date in dates:
-        analysis_start = prediction_date + relativedelta(
-            days=-max(1, round(timeframe_months * 30.4375))
-        )
+    group_cache: DailyHistoryCache | None = None
+    group_state_context = None
+    if config.performance_cache:
+        from data_access.market import get_daily_history as _raw_group_history_loader
 
-        states, limitations, timing_limited = _build_complete_state_atoms(
-            ticker=config.ticker,
-            benchmark=config.benchmark,
-            prediction_date=prediction_date,
-            analysis_start=analysis_start,
-            company_rows=company_rows,
-            benchmark_rows=benchmark_rows,
-            macro_histories=macro_histories,
-            global_histories=global_histories,
-            industry=industry,
-            sector=sector,
-            industry_constituents=industry_constituents,
-            sector_constituents=sector_constituents,
-        )
+        group_cache = DailyHistoryCache(_raw_group_history_loader)
+        group_state_context = patch_group_state_history_loader(group_cache)
+        group_state_context.__enter__()
 
-        if states:
-            state_dates = [
-                row["report_date"]
-                for row in company_rows
-                if row["report_date"] <= prediction_date
-            ]
-            if state_dates and max(state_dates) > prediction_date:
-                state_future_violations += 1
+    _progress(
+        config.progress_logging,
+        "Historical panel | candidate_dates=%d | step=%d trading days | cache=%s",
+        len(dates), config.step_trading_days,
+        "ON" if config.performance_cache else "OFF",
+    )
 
-        if not states:
-            skipped_no_state += 1
-            continue
+    try:
+        for date_index, prediction_date in enumerate(dates, start=1):
+            def log_panel_progress() -> None:
+                if (
+                    date_index == 1
+                    or date_index % max(1, config.progress_every) == 0
+                    or date_index == len(dates)
+                ):
+                    cache_message = ""
+                    if group_cache is not None:
+                        cache_message = (
+                            f" | group_cache hits={group_cache.stats.hits} "
+                            f"misses={group_cache.stats.misses} "
+                            f"unique={group_cache.unique_tickers}"
+                        )
+                    _progress(
+                        config.progress_logging,
+                        "Panel progress %d/%d (%.1f%%) | valid=%d no_state=%d no_outcome=%d | %.2fs elapsed%s",
+                        date_index, len(dates), (date_index / len(dates)) * 100.0,
+                        len(snapshots), skipped_no_state, skipped_no_outcome,
+                        time.perf_counter() - run_start, cache_message,
+                    )
 
-        outcome = _build_table_outcome(
-            company_rows,
-            benchmark_rows,
-            config.ticker,
-            prediction_date,
-            config.holding_period_months,
-            config.entry_mode,
-            config.benchmark,
-        )
-
-        if (
-            outcome.entry_date is not None
-            and config.entry_mode == "next_trading_day"
-            and outcome.entry_date <= prediction_date
-        ):
-            outcome_temporal_violations += 1
-        if (
-            outcome.entry_date is not None
-            and outcome.exit_date is not None
-            and outcome.exit_date < outcome.entry_date
-        ):
-            outcome_temporal_violations += 1
-
-        if not outcome.valid or outcome.stock_return_pct is None:
-            skipped_no_outcome += 1
-            continue
-
-        financial_timing_limited_observations += len(timing_limited)
-        snapshots.append(
-            HistoricalStateSnapshot(
-                as_of_date=prediction_date,
-                data_cutoff_date=prediction_date,
-                target=config.ticker,
-                scope="company",
-                states=states,
-                limitations=tuple(sorted(set(limitations))),
+            analysis_start = prediction_date + relativedelta(
+                days=-max(1, round(timeframe_months * 30.4375))
             )
-        )
-        outcomes.append(outcome)
+
+            states, limitations, timing_limited = _build_complete_state_atoms(
+                ticker=config.ticker,
+                benchmark=config.benchmark,
+                prediction_date=prediction_date,
+                analysis_start=analysis_start,
+                company_rows=company_rows,
+                benchmark_rows=benchmark_rows,
+                macro_histories=macro_histories,
+                global_histories=global_histories,
+                industry=industry,
+                sector=sector,
+                industry_constituents=industry_constituents,
+                sector_constituents=sector_constituents,
+            )
+
+            if states:
+                state_dates = [
+                    row["report_date"]
+                    for row in company_rows
+                    if row["report_date"] <= prediction_date
+                ]
+                if state_dates and max(state_dates) > prediction_date:
+                    state_future_violations += 1
+
+            if not states:
+                skipped_no_state += 1
+                log_panel_progress()
+                continue
+
+            outcome = _build_table_outcome(
+                company_rows,
+                benchmark_rows,
+                config.ticker,
+                prediction_date,
+                config.holding_period_months,
+                config.entry_mode,
+                config.benchmark,
+            )
+
+            if (
+                outcome.entry_date is not None
+                and config.entry_mode == "next_trading_day"
+                and outcome.entry_date <= prediction_date
+            ):
+                outcome_temporal_violations += 1
+            if (
+                outcome.entry_date is not None
+                and outcome.exit_date is not None
+                and outcome.exit_date < outcome.entry_date
+            ):
+                outcome_temporal_violations += 1
+
+            if not outcome.valid or outcome.stock_return_pct is None:
+                skipped_no_outcome += 1
+                log_panel_progress()
+                continue
+
+            financial_timing_limited_observations += len(timing_limited)
+            snapshots.append(
+                HistoricalStateSnapshot(
+                    as_of_date=prediction_date,
+                    data_cutoff_date=prediction_date,
+                    target=config.ticker,
+                    scope="company",
+                    states=states,
+                    limitations=tuple(sorted(set(limitations))),
+                )
+            )
+            outcomes.append(outcome)
+
+            log_panel_progress()
+
+
+    finally:
+        if group_state_context is not None:
+            group_state_context.__exit__(None, None, None)
 
     if not snapshots:
         raise RuntimeError(
@@ -918,13 +1085,34 @@ def build_real_olap_relationship_panel(
         "macro_series": len(macro_histories),
         "global_series": len(global_histories),
     }
+    _progress(
+        config.progress_logging,
+        "Panel complete | valid_pairs=%d candidates=%d | %.2fs elapsed",
+        panel.stats.valid_pairs, candidate_observations,
+        time.perf_counter() - run_start,
+    )
+    if group_cache is not None:
+        _progress(
+            config.progress_logging,
+            "History cache | requests=%d hits=%d misses=%d unique_tickers=%d",
+            group_cache.stats.requests, group_cache.stats.hits,
+            group_cache.stats.misses, group_cache.unique_tickers,
+        )
     return list(panel.observations), stats, latest_market_date
 
 
 def validate_real_olap_relationships(
     config: RealOLAPValidationConfig,
 ) -> RealOLAPValidationResult:
+    validation_start = time.perf_counter()
+    _configure_progress_logging(config.progress_logging)
+    _progress(config.progress_logging, "Validation start | hardened=%s | observations will be built first", config.hardened_validation)
     observations, stats, latest_market_date = build_real_olap_relationship_panel(config)
+    _progress(
+        config.progress_logging,
+        "Validation input ready | observations=%d | building walk-forward validation",
+        len(observations),
+    )
 
     from .hardening_4_10 import audit_state_surface
 
@@ -935,6 +1123,10 @@ def validate_real_olap_relationships(
         combined_state_surface,
         EXPECTED_PHASE4_STATE_FAMILIES,
     )
+    time_safe_surface_audit = audit_state_surface(
+        combined_state_surface,
+        TIME_SAFE_PHASE4_STATE_FAMILIES,
+    )
 
     engine = RelationshipDiscoveryEngine(
         max_order=3,
@@ -944,6 +1136,7 @@ def validate_real_olap_relationships(
     from .walk_forward_relationship import validate_walk_forward_relationships_hardened
 
     if config.hardened_validation:
+        _progress(config.progress_logging, "Walk-forward hardening start | purge=True | max_order=3")
         result = validate_walk_forward_relationships_hardened(
             observations=observations,
             engine=engine,
@@ -951,6 +1144,7 @@ def validate_real_olap_relationships(
             purge_overlapping_labels=True,
         )
     else:
+        _progress(config.progress_logging, "Walk-forward validation start | hardened=False")
         from .walk_forward_relationship import validate_walk_forward_relationships
         result = validate_walk_forward_relationships(
             observations=observations,
@@ -958,18 +1152,32 @@ def validate_real_olap_relationships(
             min_training_observations=config.min_training_observations,
         )
 
+    _progress(
+        config.progress_logging,
+        "Validation complete | folds=%d | leakage=%d | %.2fs elapsed",
+        len(result.folds), result.leakage_violations,
+        time.perf_counter() - validation_start,
+    )
+
     first_prediction_date = min(
         (observation.as_of_date for observation in observations),
         default=None,
     )
 
     timing_limited = tuple(stats.get("timing_limited_families", ()))
+    integrity_clean = (
+        result.leakage_violations == 0
+        and stats.get("state_future_violations", 0) == 0
+        and stats.get("outcome_temporal_violations", 0) == 0
+    )
     broad_validated = (
         not surface_audit.missing_families
         and not timing_limited
-        and result.leakage_violations == 0
-        and stats.get("state_future_violations", 0) == 0
-        and stats.get("outcome_temporal_violations", 0) == 0
+        and integrity_clean
+    )
+    time_safe_validated = (
+        not time_safe_surface_audit.missing_families
+        and integrity_clean
     )
 
     return RealOLAPValidationResult(
@@ -991,9 +1199,11 @@ def validate_real_olap_relationships(
         latest_market_date=latest_market_date,
         first_prediction_date=first_prediction_date,
         state_surface_coverage_pct=surface_audit.coverage_pct,
+        time_safe_state_surface_coverage_pct=time_safe_surface_audit.coverage_pct,
         missing_state_families=surface_audit.missing_families,
         timing_limited_state_families=timing_limited,
         broad_relationship_surface_validated=broad_validated,
+        time_safe_relationship_surface_validated=time_safe_validated,
         purged_training_observations=getattr(result, "purged_training_observations", 0),
         unknown_overlap_observations=getattr(result, "unknown_overlap_observations", 0),
         selection_candidate_evaluations=getattr(result, "selection_candidate_evaluations", 0),

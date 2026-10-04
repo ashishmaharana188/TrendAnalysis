@@ -29,6 +29,22 @@ def main() -> None:
     assert result.latest_market_date is not None
     assert result.first_prediction_date is not None
 
+    timing_limited = set(result.timing_limited_state_families)
+    missing = set(result.missing_state_families)
+    financial_families = {
+        "company.financials",
+        "industry.financials",
+        "sector.financials",
+    }
+
+    # Completion gate: every currently admissible state family must be
+    # connected and leak-safe. Financial families are permitted to remain
+    # explicitly provenance-blocked until publication timestamps exist.
+    assert result.time_safe_state_surface_coverage_pct >= 99.99
+    assert not (missing - financial_families)
+    assert timing_limited <= financial_families
+    assert result.time_safe_relationship_surface_validated
+
     print("PHASE 4.10 HARDENED REAL OLAP INTEGRITY VALIDATION: PASS")
     print("Ticker:", result.ticker)
     print("Benchmark:", result.benchmark)
@@ -56,10 +72,12 @@ def main() -> None:
     print("Outcome temporal violations:", result.outcome_temporal_violations)
     print("Latest market date:", result.latest_market_date)
     print("State surface coverage:", result.state_surface_coverage_pct)
+    print("Time-safe state surface coverage:", result.time_safe_state_surface_coverage_pct)
     print("Missing state families:", list(result.missing_state_families))
     print("Timing-limited state families:", list(result.timing_limited_state_families))
     print("Financial timing-limited observations:", result.financial_timing_limited_observations)
     print("Broad relationship surface validated:", result.broad_relationship_surface_validated)
+    print("Time-safe relationship surface validated:", result.time_safe_relationship_surface_validated)
 
 
 if __name__ == "__main__":
