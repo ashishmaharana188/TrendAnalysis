@@ -36,10 +36,9 @@ TIMEFRAME_MONTHS: dict[str, float] = {
 }
 
 
-# Phase 3 defines nine meaningful Phase 4 state families. Financial families
-# are kept separate because historical publication/availability dates are not
-# present in the OLAP schema and therefore cannot safely participate in a
-# point-in-time relationship panel yet.
+# Phase 4 covers every daily evidence family in the intended initial TrendAnalysis
+# surface. Financial families remain timing-limited because OLAP ReportDate is
+# an accounting period end rather than a verified information-availability date.
 EXPECTED_PHASE4_STATE_FAMILIES = (
     "company.market",
     "company.financials",
@@ -50,6 +49,10 @@ EXPECTED_PHASE4_STATE_FAMILIES = (
     "macro",
     "global",
     "benchmark",
+    "institutional",
+    "derivatives",
+    "microstructure",
+    "trade_events",
 )
 FINANCIAL_TIMING_LIMITED_FAMILIES = (
     "company.financials",
@@ -74,6 +77,13 @@ TIME_SAFE_PHASE4_STATE_FAMILIES = tuple(
     family
     for family in EXPECTED_PHASE4_STATE_FAMILIES
     if family not in FINANCIAL_TIMING_LIMITED_FAMILIES
+)
+
+FLOW_STATE_FAMILIES = (
+    "institutional",
+    "derivatives",
+    "microstructure",
+    "trade_events",
 )
 
 
@@ -133,6 +143,11 @@ class RealOLAPValidationResult:
     sector_constituents: int = 0
     macro_series: int = 0
     global_series: int = 0
+    institutional_rows: int = 0
+    options_rows: int = 0
+    basis_rows: int = 0
+    trade_event_rows: int = 0
+    microstructure_rows: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -726,6 +741,151 @@ def _current_membership(ticker: str) -> tuple[str | None, str | None, list[str],
     return industry, sector, sorted(set(industry_constituents)), sorted(set(sector_constituents))
 
 
+def _call_history_loader(loader: Any, *, ticker: str | None, start_date: date, end_date: date):
+    """Call a Phase 2 repository using its declared parameter names."""
+    import inspect
+
+    params = inspect.signature(loader).parameters
+    kwargs: dict[str, Any] = {}
+    for name in params:
+        lowered = name.lower()
+        if lowered in {"ticker", "symbol", "identifier", "instrument", "security"} and ticker is not None:
+            kwargs[name] = ticker
+        elif lowered in {"start_date", "from_date", "begin_date", "date_from"}:
+            kwargs[name] = start_date
+        elif lowered in {"end_date", "to_date", "until_date", "date_to"}:
+            kwargs[name] = end_date
+    try:
+        return loader(**kwargs)
+    except TypeError:
+        if ticker is not None:
+            return loader(ticker, start_date=start_date, end_date=end_date)
+        return loader(start_date=start_date, end_date=end_date)
+
+
+def _generic_rows(table: Any) -> list[dict[str, Any]]:
+    if table is None:
+        return []
+    if hasattr(table, "to_pylist"):
+        raw = table.to_pylist()
+    elif isinstance(table, list):
+        raw = table
+    else:
+        return []
+    rows: list[dict[str, Any]] = []
+    for row in raw:
+        if not isinstance(row, dict):
+            continue
+        normalized = {str(key).strip().lower(): value for key, value in row.items()}
+        raw_date = normalized.get("report_date") or normalized.get("date") or normalized.get("event_date")
+        if raw_date is None:
+            continue
+        try:
+            normalized["report_date"] = _as_date(raw_date)
+        except (TypeError, ValueError):
+            continue
+        rows.append(normalized)
+    return rows
+
+
+def _load_flow_histories(
+    start_date: date,
+    end_date: date,
+    ticker: str,
+    progress_logging: bool = True,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    """Load institutional, option, futures-basis, event and matrix histories via repositories."""
+    institutional_rows: list[dict[str, Any]] = []
+    options_rows: list[dict[str, Any]] = []
+    basis_rows: list[dict[str, Any]] = []
+    trade_rows: list[dict[str, Any]] = []
+    microstructure_rows: list[dict[str, Any]] = []
+
+    try:
+        from data_access import institutional as institutional_repo
+        keyed: dict[tuple[date, str], dict[str, Any]] = {}
+        for loader_name in ("get_institutional_history", "get_institutional_flow_history"):
+            loader = getattr(institutional_repo, loader_name, None)
+            if loader is None:
+                continue
+            for row in _generic_rows(
+                _call_history_loader(loader, ticker=None, start_date=start_date, end_date=end_date)
+            ):
+                client_type = str(row.get("client_type", "ALL"))
+                key = (row["report_date"], client_type)
+                keyed.setdefault(key, {}).update(row)
+        institutional_rows = [row for _, row in sorted(keyed.items(), key=lambda item: item[0])]
+    except (ImportError, AttributeError):
+        pass
+
+    try:
+        from data_access.derivatives import get_options_history
+        options_rows = _generic_rows(_call_history_loader(get_options_history, ticker=ticker, start_date=start_date, end_date=end_date))
+    except (ImportError, AttributeError):
+        pass
+
+    try:
+        from data_access.derivatives import get_futures_basis_history
+        basis_rows = _generic_rows(_call_history_loader(get_futures_basis_history, ticker=ticker, start_date=start_date, end_date=end_date))
+    except (ImportError, AttributeError):
+        pass
+
+    try:
+        from data_access.trade_events import get_trade_events
+        trade_rows = _generic_rows(_call_history_loader(get_trade_events, ticker=ticker, start_date=start_date, end_date=end_date))
+    except (ImportError, AttributeError):
+        pass
+
+    try:
+        from data_access.derivatives import get_unified_market_matrix
+        microstructure_rows = _generic_rows(_call_history_loader(get_unified_market_matrix, ticker=ticker, start_date=start_date, end_date=end_date))
+    except (ImportError, AttributeError):
+        pass
+
+    _progress(
+        progress_logging,
+        "Flow context loaded | institutional=%d options=%d basis=%d trade_events=%d microstructure=%d",
+        len(institutional_rows), len(options_rows), len(basis_rows), len(trade_rows), len(microstructure_rows),
+    )
+    return institutional_rows, options_rows, basis_rows, trade_rows, microstructure_rows
+
+
+def _build_flow_atoms(
+    institutional_rows: list[dict[str, Any]],
+    options_rows: list[dict[str, Any]],
+    basis_rows: list[dict[str, Any]],
+    trade_rows: list[dict[str, Any]],
+    microstructure_rows: list[dict[str, Any]],
+    analysis_start: date,
+    prediction_date: date,
+) -> tuple[dict[str, str], list[str]]:
+    from analysis.flow_state import (
+        build_derivatives_state_atoms,
+        build_institutional_state_atoms,
+        build_microstructure_state_atoms,
+        build_trade_event_state_atoms,
+    )
+    states: dict[str, str] = {}
+    limitations: list[str] = []
+    if institutional_rows:
+        states.update(build_institutional_state_atoms(institutional_rows, analysis_start, prediction_date))
+    else:
+        limitations.append("Institutional history unavailable through the cutoff.")
+    if options_rows or basis_rows:
+        states.update(build_derivatives_state_atoms(options_rows, basis_rows, analysis_start, prediction_date))
+    else:
+        limitations.append("Derivative options/futures history unavailable through the cutoff.")
+    if trade_rows:
+        states.update(build_trade_event_state_atoms(trade_rows, analysis_start, prediction_date))
+    else:
+        limitations.append("Trade-event history unavailable through the cutoff.")
+    if microstructure_rows:
+        states.update(build_microstructure_state_atoms(microstructure_rows, analysis_start, prediction_date))
+    else:
+        limitations.append("Unified market microstructure matrix unavailable through the cutoff.")
+    return states, limitations
+
+
 def _build_complete_state_atoms(
     *,
     ticker: str,
@@ -740,6 +900,11 @@ def _build_complete_state_atoms(
     sector: str | None,
     industry_constituents: list[str],
     sector_constituents: list[str],
+    institutional_rows: list[dict[str, Any]],
+    options_rows: list[dict[str, Any]],
+    basis_rows: list[dict[str, Any]],
+    trade_rows: list[dict[str, Any]],
+    microstructure_rows: list[dict[str, Any]],
 ) -> tuple[dict[str, str], list[str], list[str]]:
     """
     Build the real Phase 4 state surface from the existing Phase 3 engines.
@@ -797,6 +962,13 @@ def _build_complete_state_atoms(
         )
     )
 
+    flow_states, flow_limitations = _build_flow_atoms(
+        institutional_rows, options_rows, basis_rows, trade_rows, microstructure_rows,
+        analysis_start, prediction_date,
+    )
+    states.update(flow_states)
+    limitations.extend(flow_limitations)
+
     benchmark_table = pa.Table.from_pylist(benchmark_historical) if benchmark_historical else None
 
     if industry and industry_constituents:
@@ -849,7 +1021,7 @@ def build_real_olap_relationship_panel(
 
     The adapter now exposes the complete *time-safe* real state surface:
         company.market, industry.market, sector.market, macro, global,
-        benchmark.
+        benchmark, institutional, derivatives, microstructure, trade_events.
 
     Financial families are wired as a known timing limitation rather than
     backdated into the historical relationship panel.
@@ -908,11 +1080,23 @@ def build_real_olap_relationship_panel(
         config.ticker,
         progress_logging=config.progress_logging,
     )
+    (
+        institutional_rows,
+        options_rows,
+        basis_rows,
+        trade_rows,
+        microstructure_rows,
+    ) = _load_flow_histories(
+        earliest_date,
+        latest_market_date,
+        config.ticker,
+        progress_logging=config.progress_logging,
+    )
 
     _progress(
         config.progress_logging,
-        "Context loaded | macro_series=%d global_series=%d | %.2fs elapsed",
-        len(macro_histories), len(global_histories),
+        "Context loaded | macro_series=%d global_series=%d institutional=%d options=%d basis=%d trade_events=%d microstructure=%d | %.2fs elapsed",
+        len(macro_histories), len(global_histories), len(institutional_rows), len(options_rows), len(basis_rows), len(trade_rows), len(microstructure_rows),
         time.perf_counter() - run_start,
     )
 
@@ -991,6 +1175,11 @@ def build_real_olap_relationship_panel(
                 sector=sector,
                 industry_constituents=industry_constituents,
                 sector_constituents=sector_constituents,
+                institutional_rows=institutional_rows,
+                options_rows=options_rows,
+                basis_rows=basis_rows,
+                trade_rows=trade_rows,
+                microstructure_rows=microstructure_rows,
             )
 
             if states:
@@ -1084,6 +1273,11 @@ def build_real_olap_relationship_panel(
         "sector_constituents": len(sector_constituents),
         "macro_series": len(macro_histories),
         "global_series": len(global_histories),
+        "institutional_rows": len(institutional_rows),
+        "options_rows": len(options_rows),
+        "basis_rows": len(basis_rows),
+        "trade_event_rows": len(trade_rows),
+        "microstructure_rows": len(microstructure_rows),
     }
     _progress(
         config.progress_logging,
@@ -1219,4 +1413,9 @@ def validate_real_olap_relationships(
         sector_constituents=stats.get("sector_constituents", 0),
         macro_series=stats.get("macro_series", 0),
         global_series=stats.get("global_series", 0),
+        institutional_rows=stats.get("institutional_rows", 0),
+        options_rows=stats.get("options_rows", 0),
+        basis_rows=stats.get("basis_rows", 0),
+        trade_event_rows=stats.get("trade_event_rows", 0),
+        microstructure_rows=stats.get("microstructure_rows", 0),
     )
