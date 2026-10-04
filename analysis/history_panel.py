@@ -108,6 +108,7 @@ class HistoricalStateOutcomePanel:
                     "stock_return_pct": item.stock_return_pct,
                     "benchmark_return_pct": item.benchmark_return_pct,
                     "relative_return_pct": item.relative_return_pct,
+                    "outcome_end_date": item.outcome_end_date,
                 }
                 for item in self.observations
             ],
@@ -375,6 +376,11 @@ def build_historical_state_outcome_panel(
                     None
                     if outcome.relative_return_pct is None
                     else float(outcome.relative_return_pct)
+                ),
+                outcome_end_date=(
+                    None
+                    if outcome.exit_date is None
+                    else _as_date(outcome.exit_date)
                 ),
             )
         )

@@ -58,13 +58,15 @@ def main() -> None:
     assert results
     pair = next(item for item in results if len(item.variables) == 2)
 
-    # Method B keeps the full distribution, so its effective sample size
-    # must be materially larger than the minimum matching-condition sample.
-    assert pair.sample_count >= 20
+    # Method B reports one coherent weighted population. Its effective sample
+    # size can never exceed the number of weighted observations. Exact matches
+    # are retained only as a secondary diagnostic.
+    assert pair.sample_count == 60
+    assert pair.exact_condition_count == 24
     assert pair.weighted_mean_return_pct is not None
     assert pair.weighted_positive_rate_pct is not None
     assert pair.effective_sample_size is not None
-    assert pair.effective_sample_size >= pair.sample_count
+    assert pair.effective_sample_size <= pair.sample_count
     assert pair.weight_concentration is not None
     assert pair.weight_concentration < 0.5
     assert pair.mean_return_pct > 0

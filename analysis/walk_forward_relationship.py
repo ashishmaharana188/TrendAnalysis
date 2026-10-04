@@ -4,6 +4,13 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Iterable
 
+from .hardening_4_10 import (
+    audit_parameter_manifest,
+    search_adjusted_permutation_p_values,
+    TestingFamily,
+    benjamini_hochberg,
+)
+
 from .ranking import RelationshipRanking, rank_relationships
 from .relationship import (
     HistoricalRelationshipObservation,
@@ -55,6 +62,11 @@ class WalkForwardValidationResult:
     leakage_violations: int
     skipped_insufficient_history: int
     skipped_no_relationship: int
+    purged_training_observations: int = 0
+    unknown_overlap_observations: int = 0
+    selection_candidate_evaluations: int = 0
+    selection_validated_predictions: int = 0
+    multiple_testing_controlled_folds: int = 0
 
     def as_dict(self) -> dict:
         return {
@@ -65,6 +77,11 @@ class WalkForwardValidationResult:
             "leakage_violations": self.leakage_violations,
             "skipped_insufficient_history": self.skipped_insufficient_history,
             "skipped_no_relationship": self.skipped_no_relationship,
+            "purged_training_observations": self.purged_training_observations,
+            "unknown_overlap_observations": self.unknown_overlap_observations,
+            "selection_candidate_evaluations": self.selection_candidate_evaluations,
+            "selection_validated_predictions": self.selection_validated_predictions,
+            "multiple_testing_controlled_folds": self.multiple_testing_controlled_folds,
         }
 
 
@@ -312,4 +329,290 @@ def validate_walk_forward_relationships(
         leakage_violations=leakage_violations,
         skipped_insufficient_history=skipped_insufficient_history,
         skipped_no_relationship=skipped_no_relationship,
+    )
+
+
+
+def _method_results_for_candidate(
+    method: str,
+    candidate_variables: tuple[str, ...],
+    current_states: dict[str, str],
+    history: list[HistoricalRelationshipObservation],
+    engine: RelationshipDiscoveryEngine,
+) -> object | None:
+    subset = {feature: current_states[feature] for feature in candidate_variables if feature in current_states}
+    if len(subset) != len(candidate_variables):
+        return None
+    if method == "A":
+        results = engine.method_a_similar_states(subset, history)
+    else:
+        results = engine.method_b_conditioned_distribution(subset, history)
+    return next((item for item in results if tuple(sorted(item.variables)) == tuple(sorted(candidate_variables))), None)
+
+
+def _holdout_select(
+    method: str,
+    discovery_results: list,
+    current_states: dict[str, str],
+    selection_history: list[HistoricalRelationshipObservation],
+    engine: RelationshipDiscoveryEngine,
+    family: TestingFamily,
+    *,
+    alpha: float,
+) -> tuple[object | None, int, bool]:
+    """
+    Select a discovered relationship on a chronological inner holdout.
+
+    Discovery candidates are fixed before the selection set is touched. Each
+    candidate is independently re-evaluated on the selection set, then the
+    empirical p-values are FDR-adjusted. No candidate with a failed adjustment
+    is promoted to the outer test prediction.
+    """
+    if not discovery_results or not selection_history:
+        return None, 0, False
+
+    evaluations: list[object] = []
+    baseline_mean = sum(item.stock_return_pct for item in selection_history) / len(selection_history)
+
+    for candidate in discovery_results:
+        evaluated = _method_results_for_candidate(
+            method,
+            tuple(candidate.variables),
+            current_states,
+            selection_history,
+            engine,
+        )
+        if evaluated is None or not getattr(evaluated, "supporting_observations", None):
+            continue
+        evaluations.append(evaluated)
+
+    if not evaluations:
+        return None, 0, False
+
+    permutation = search_adjusted_permutation_p_values(
+        [
+            (result.supporting_observations, result.supporting_weights)
+            for result in evaluations
+        ],
+        baseline_mean,
+        family_id=family.family_id,
+        universe_observations=[
+            (item.as_of_date, float(item.stock_return_pct))
+            for item in selection_history
+        ],
+        permutations=199,
+        seed=sum(ord(ch) for ch in family.family_id) + len(selection_history),
+    )
+    adjusted, accepted = benjamini_hochberg(
+        permutation.max_statistic_p_values,
+        alpha=alpha,
+    )
+    if not accepted:
+        return None, len(evaluations), True
+
+    accepted_rows = [
+        (evaluations[index], adjusted[index])
+        for index in accepted
+    ]
+    selected, _q = min(
+        accepted_rows,
+        key=lambda row: (
+            row[1],
+            -abs(float(row[0].score)),
+            -float(row[0].reliability),
+        ),
+    )
+    return selected, len(evaluations), True
+
+
+def validate_walk_forward_relationships_hardened(
+    observations: Iterable[HistoricalRelationshipObservation],
+    engine: RelationshipDiscoveryEngine,
+    min_training_observations: int | None = None,
+    *,
+    selection_fraction: float = 0.30,
+    multiple_testing_alpha: float = 0.10,
+    purge_overlapping_labels: bool = True,
+) -> WalkForwardValidationResult:
+    """
+    Methodological-hardening validator for Phase 4.10.
+
+    Outer test observations are never used for discovery or selection. The
+    training sample is split chronologically into discovery and selection
+    segments. Candidate relationships are discovered in the earlier segment,
+    selected on the later segment with FDR control, then scored on the held-out
+    outer observation. When outcome_end_date is known, training labels whose
+    realized horizons overlap the outer prediction date are purged. Unknown
+    horizons are conservatively excluded in hardened mode.
+    """
+    if not 0.0 < selection_fraction < 1.0:
+        raise ValueError("selection_fraction must be in (0, 1)")
+    if not 0.0 < multiple_testing_alpha < 1.0:
+        raise ValueError("multiple_testing_alpha must be in (0, 1)")
+
+    rows = sorted(list(observations), key=lambda item: _as_date(item.as_of_date))
+    if not rows:
+        return validate_walk_forward_relationships(rows, engine, min_training_observations)
+
+    minimum = engine.min_observations if min_training_observations is None else int(min_training_observations)
+    if minimum < engine.min_observations:
+        raise ValueError("min_training_observations cannot be below engine.min_observations")
+
+    folds: list[WalkForwardFold] = []
+    method_a_rows: list[dict] = []
+    method_b_rows: list[dict] = []
+    combined_rows: list[dict] = []
+    leakage_violations = 0
+    skipped_insufficient_history = 0
+    skipped_no_relationship = 0
+    purged_training = 0
+    unknown_overlap = 0
+    selection_evaluations = 0
+    selection_validated = 0
+    controlled_folds = 0
+
+    for index, test_observation in enumerate(rows):
+        prediction_date = _as_date(test_observation.as_of_date)
+        raw_training = [
+            item for item in rows[:index]
+            if _as_date(item.as_of_date) < prediction_date
+            and item.stock_return_pct is not None
+        ]
+        if len(raw_training) < minimum:
+            skipped_insufficient_history += 1
+            continue
+
+        training: list[HistoricalRelationshipObservation] = []
+        for item in raw_training:
+            end_date = item.outcome_end_date
+            if purge_overlapping_labels:
+                if end_date is None:
+                    unknown_overlap += 1
+                    continue
+                if _as_date(end_date) >= prediction_date:
+                    purged_training += 1
+                    continue
+            training.append(item)
+
+        if len(training) < minimum:
+            skipped_insufficient_history += 1
+            continue
+        if any(_as_date(item.as_of_date) >= prediction_date for item in training):
+            leakage_violations += 1
+            continue
+
+        split_index = int(len(training) * (1.0 - selection_fraction))
+        split_index = min(max(split_index, engine.min_observations), len(training) - 1)
+        discovery_history = training[:split_index]
+        selection_history = training[split_index:]
+        if len(discovery_history) < minimum or len(selection_history) < engine.min_observations:
+            skipped_insufficient_history += 1
+            continue
+
+        discovery_engine = RelationshipDiscoveryEngine(
+            max_order=engine.max_order,
+            min_observations=engine.min_observations,
+            min_state_coverage_pct=engine.min_state_coverage_pct,
+            min_family_coverage_pct=engine.min_family_coverage_pct,
+            stability_sem_multiplier=engine.stability_sem_multiplier,
+        )
+        discovery_a = discovery_engine.method_a_similar_states(test_observation.states, discovery_history)
+        discovery_b = discovery_engine.method_b_conditioned_distribution(test_observation.states, discovery_history)
+
+        required_a = (
+            "state_relevance_frequency",
+            "method_a_adaptive_neighbor_count",
+        )
+        required_b = (
+            "state_relevance_frequency",
+            "method_b_similarity_scale",
+        )
+        audits_a = [
+            audit_parameter_manifest(required_a, result.parameter_provenance, prediction_date)
+            for result in discovery_a
+        ]
+        audits_b = [
+            audit_parameter_manifest(required_b, result.parameter_provenance, prediction_date)
+            for result in discovery_b
+        ]
+        if any(audit.temporal_violation for audit in (*audits_a, *audits_b)):
+            leakage_violations += 1
+            continue
+        if any(not audit.complete for audit in (*audits_a, *audits_b)):
+            skipped_insufficient_history += 1
+            continue
+
+        family_a = TestingFamily(
+            target=test_observation.target,
+            scope=test_observation.scope,
+            method="A",
+            prediction_date=prediction_date,
+        )
+        family_b = TestingFamily(
+            target=test_observation.target,
+            scope=test_observation.scope,
+            method="B",
+            prediction_date=prediction_date,
+        )
+
+        selected_a, count_a, controlled_a = _holdout_select(
+            "A", discovery_a, test_observation.states, selection_history, discovery_engine, family_a, alpha=multiple_testing_alpha
+        )
+        selected_b, count_b, controlled_b = _holdout_select(
+            "B", discovery_b, test_observation.states, selection_history, discovery_engine, family_b, alpha=multiple_testing_alpha
+        )
+        selection_evaluations += count_a + count_b
+        if controlled_a or controlled_b:
+            controlled_folds += 1
+        if selected_a is not None or selected_b is not None:
+            selection_validated += 1
+
+        # The selected inner-holdout result supplies the directional prediction
+        # for the outer test date. No test outcome enters this step.
+        ranking_a = _top_ranking([selected_a] if selected_a is not None else [])
+        ranking_b = _top_ranking([selected_b] if selected_b is not None else [])
+
+        row_a = _fold_result(ranking_a, float(test_observation.stock_return_pct))
+        row_b = _fold_result(ranking_b, float(test_observation.stock_return_pct))
+
+        common_ranking = None
+        if ranking_a is not None and ranking_b is not None and ranking_a.direction == ranking_b.direction:
+            common_ranking = ranking_a
+        row_combined = _fold_result(common_ranking, float(test_observation.stock_return_pct))
+
+        if row_a is None and row_b is None and row_combined is None:
+            skipped_no_relationship += 1
+
+        if row_a is not None:
+            method_a_rows.append(row_a)
+        if row_b is not None:
+            method_b_rows.append(row_b)
+        if row_combined is not None:
+            combined_rows.append(row_combined)
+
+        folds.append(
+            WalkForwardFold(
+                prediction_date=prediction_date,
+                training_observations=len(training),
+                actual_return_pct=float(test_observation.stock_return_pct),
+                method_a=row_a,
+                method_b=row_b,
+                combined=row_combined,
+            )
+        )
+
+    evaluated = len(folds)
+    return WalkForwardValidationResult(
+        folds=tuple(folds),
+        method_a=_summary("A", method_a_rows, evaluated),
+        method_b=_summary("B", method_b_rows, evaluated),
+        combined=_summary("COMBINED", combined_rows, evaluated),
+        leakage_violations=leakage_violations,
+        skipped_insufficient_history=skipped_insufficient_history,
+        skipped_no_relationship=skipped_no_relationship,
+        purged_training_observations=purged_training,
+        unknown_overlap_observations=unknown_overlap,
+        selection_candidate_evaluations=selection_evaluations,
+        selection_validated_predictions=selection_validated,
+        multiple_testing_controlled_folds=controlled_folds,
     )

@@ -12,8 +12,10 @@ from .history_panel import (
     HistoricalStateSnapshot,
     build_historical_state_outcome_panel,
 )
-from .relationship import HistoricalRelationshipObservation, RelationshipDiscoveryEngine
-from .walk_forward_relationship import validate_walk_forward_relationships
+from .relationship import (
+    HistoricalRelationshipObservation,
+    RelationshipDiscoveryEngine,
+)
 
 
 TIMEFRAME_MONTHS: dict[str, float] = {
@@ -31,6 +33,28 @@ TIMEFRAME_MONTHS: dict[str, float] = {
 }
 
 
+# Phase 3 defines nine meaningful Phase 4 state families. Financial families
+# are kept separate because historical publication/availability dates are not
+# present in the OLAP schema and therefore cannot safely participate in a
+# point-in-time relationship panel yet.
+EXPECTED_PHASE4_STATE_FAMILIES = (
+    "company.market",
+    "company.financials",
+    "industry.market",
+    "industry.financials",
+    "sector.market",
+    "sector.financials",
+    "macro",
+    "global",
+    "benchmark",
+)
+FINANCIAL_TIMING_LIMITED_FAMILIES = (
+    "company.financials",
+    "industry.financials",
+    "sector.financials",
+)
+
+
 @dataclass(frozen=True)
 class RealOLAPValidationConfig:
     ticker: str = "RELIANCE"
@@ -38,9 +62,10 @@ class RealOLAPValidationConfig:
     analysis_timeframe: str = "6M"
     holding_period_months: float = 1.0
     entry_mode: str = "next_trading_day"
-    max_folds: int = 60
-    step_trading_days: int = 20
+    max_folds: int = 250
+    step_trading_days: int = 5
     min_training_observations: int = 12
+    hardened_validation: bool = True
 
 
 @dataclass(frozen=True)
@@ -62,6 +87,25 @@ class RealOLAPValidationResult:
     outcome_temporal_violations: int
     latest_market_date: date | None
     first_prediction_date: date | None
+    state_surface_coverage_pct: float = 0.0
+    missing_state_families: tuple[str, ...] = ()
+    timing_limited_state_families: tuple[str, ...] = ()
+    broad_relationship_surface_validated: bool = False
+    purged_training_observations: int = 0
+    unknown_overlap_observations: int = 0
+    selection_candidate_evaluations: int = 0
+    selection_validated_predictions: int = 0
+    multiple_testing_controlled_folds: int = 0
+    method_a_directional_predictions: int = 0
+    method_b_directional_predictions: int = 0
+    combined_directional_predictions: int = 0
+    candidate_observations: int = 0
+    valid_state_observations: int = 0
+    financial_timing_limited_observations: int = 0
+    industry_constituents: int = 0
+    sector_constituents: int = 0
+    macro_series: int = 0
+    global_series: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return self.__dict__.copy()
@@ -148,17 +192,25 @@ def _state_label(value: Any) -> str | None:
     return label if isinstance(label, str) else None
 
 
-def _build_state_atoms(
+def _metric_state_atoms(
+    family: str,
+    state_objects: dict[str, Any],
+) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for metric, state_object in state_objects.items():
+        label = _state_label(state_object)
+        if label is None or not label.strip() or label.startswith("Unknown"):
+            continue
+        result[f"{family}.{metric}"] = label
+    return result
+
+
+def _build_company_market_atoms(
     ticker: str,
     selected_table: pa.Table,
     historical_table: pa.Table,
 ) -> dict[str, str]:
-    """
-    Invoke the existing Phase 3.5 market-state engine.
-
-    Phase 4 does not recreate state calculations. This adapter only maps the
-    existing Phase 3 state objects into the Phase 4 categorical state surface.
-    """
+    """Delegate company market-state construction to Phase 3.5."""
     from analysis.market_state import build_company_market_states
 
     states = build_company_market_states(
@@ -166,13 +218,159 @@ def _build_state_atoms(
         selected_table=selected_table,
         historical_table=historical_table,
     )
+    return _metric_state_atoms("company.market", states)
+
+
+def _build_generic_market_atoms(
+    family: str,
+    identifier: str,
+    selected_rows: list[dict[str, Any]],
+    historical_rows: list[dict[str, Any]],
+) -> dict[str, str]:
+    """Use the exact Phase 3.5 market-state engine for contextual market data."""
+    from analysis.market_state import build_company_market_states
+    from data_access.ticker import normalize_ticker
+
+    if not historical_rows:
+        return {}
+
+    # Context instruments (benchmark/global/group series) may use mixed-case
+    # source identifiers such as ``Nifty_50``.  The Phase 3 market-state
+    # engine validates against its canonical normalized ticker, so the adapter
+    # must canonicalize both the ticker argument and the synthetic ticker
+    # column consistently.  This is an adapter concern, not a change to the
+    # underlying OLAP values.
+    canonical_identifier = normalize_ticker(identifier)[0]
+
+    def canonical_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            {
+                "ticker": canonical_identifier,
+                "report_date": row["report_date"],
+                "asset_class": row.get("asset_class", "context"),
+                "open": row.get("open"),
+                "high": row.get("high"),
+                "low": row.get("low"),
+                "close": row.get("close"),
+                "volume": row.get("volume"),
+            }
+            for row in rows
+        ]
+
+    selected_canonical = canonical_rows(selected_rows)
+    historical_canonical = canonical_rows(historical_rows)
+
+    selected_table = pa.Table.from_pylist(selected_canonical)
+    historical_table = pa.Table.from_pylist(historical_canonical)
+
+    states = build_company_market_states(
+        ticker=canonical_identifier,
+        selected_table=selected_table,
+        historical_table=historical_table,
+    )
+    return _metric_state_atoms(family, states)
+
+
+def _build_macro_atoms(
+    macro_histories: dict[str, list[dict[str, Any]]],
+    analysis_start: date,
+    prediction_date: date,
+) -> dict[str, str]:
+    from analysis.state import build_variable_state
+
+    atoms: dict[str, str] = {}
+    for indicator, rows in macro_histories.items():
+        selected_rows = [
+            row for row in rows
+            if analysis_start <= row["report_date"] <= prediction_date
+        ]
+        historical_rows = [
+            row for row in rows
+            if row["report_date"] <= prediction_date
+        ]
+        if not historical_rows:
+            continue
+        selected_table = pa.Table.from_pylist(selected_rows) if selected_rows else pa.table({
+            "report_date": pa.array([], type=pa.date32()),
+            "close": pa.array([], type=pa.float64()),
+        })
+        historical_table = pa.Table.from_pylist(historical_rows)
+        state = build_variable_state(
+            variable=indicator,
+            selected_table=selected_table,
+            historical_table=historical_table,
+            value_column="close",
+        )
+        label = _state_label(state)
+        if label and not label.startswith("Unknown"):
+            atoms[f"macro.{indicator}"] = label
+    return atoms
+
+
+def _build_global_atoms(
+    global_histories: dict[str, list[dict[str, Any]]],
+    analysis_start: date,
+    prediction_date: date,
+) -> dict[str, str]:
+    from analysis.state import build_variable_state
+
+    atoms: dict[str, str] = {}
+    for ticker, rows in global_histories.items():
+        selected_rows = [
+            row for row in rows
+            if analysis_start <= row["report_date"] <= prediction_date
+        ]
+        historical_rows = [
+            row for row in rows
+            if row["report_date"] <= prediction_date
+        ]
+        if not historical_rows:
+            continue
+        selected_table = pa.Table.from_pylist(selected_rows) if selected_rows else pa.table({
+            "report_date": pa.array([], type=pa.date32()),
+            "close": pa.array([], type=pa.float64()),
+        })
+        historical_table = pa.Table.from_pylist(historical_rows)
+        state = build_variable_state(
+            variable=ticker,
+            selected_table=selected_table,
+            historical_table=historical_table,
+            value_column="close",
+        )
+        label = _state_label(state)
+        if label and not label.startswith("Unknown"):
+            atoms[f"global.{ticker}"] = label
+    return atoms
+
+
+def _group_financial_majority_atoms(
+    family: str,
+    financial_states: dict[str, Any] | None,
+) -> dict[str, str]:
+    """
+    Convert the Phase 3 group financial aggregation into descriptive majority
+    state atoms. This helper is used for current-surface inspection only; the
+    historical prediction panel deliberately excludes these atoms because
+    financial publication timing is not known.
+    """
+    if not financial_states:
+        return {}
 
     result: dict[str, str] = {}
-    for metric, state_object in states.items():
-        label = _state_label(state_object)
-        if label is None or label in {"Unknown", ""}:
+    metrics = financial_states.get("metrics", {})
+    for metric, payload in metrics.items():
+        counts = payload.get("state_counts") if isinstance(payload, dict) else None
+        if not isinstance(counts, dict) or not counts:
             continue
-        result[f"company.market.{metric}"] = label
+        ranked = sorted(
+            ((str(state), int(count)) for state, count in counts.items()),
+            key=lambda item: (-item[1], item[0]),
+        )
+        top_state, top_count = ranked[0]
+        tied = [state for state, count in ranked if count == top_count]
+        if len(tied) != 1:
+            continue
+        result[f"{family}.{metric}"] = top_state
     return result
 
 
@@ -201,6 +399,64 @@ def _resolve_benchmark_history(
         start_date=start_date,
         end_date=end_date,
     )
+
+
+def _load_all_macro_histories(
+    start_date: date,
+    end_date: date,
+    benchmark: str,
+) -> dict[str, list[dict[str, Any]]]:
+    from data_access.macro_global import get_macro_history, get_macro_indicators
+
+    result: dict[str, list[dict[str, Any]]] = {}
+    for indicator in get_macro_indicators():
+        # The selected benchmark already gets its own benchmark family. Do not
+        # feed the same underlying series into macro a second time.
+        if indicator == benchmark:
+            continue
+        rows = _table_rows(
+            get_macro_history(
+                indicator,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        )
+        if rows:
+            result[indicator] = rows
+    return result
+
+
+def _load_global_histories(
+    start_date: date,
+    end_date: date,
+    benchmark: str,
+    target: str,
+) -> dict[str, list[dict[str, Any]]]:
+    from data_access.macro_global import get_global_asset_history, get_global_assets
+    from data_access.ticker import normalize_ticker
+
+    excluded = set(normalize_ticker(target)) | set(normalize_ticker(benchmark))
+    result: dict[str, list[dict[str, Any]]] = {}
+    for asset in get_global_assets():
+        ticker = str(asset.get("ticker", "")).strip()
+        if not ticker or ticker in excluded:
+            continue
+        asset_class = str(asset.get("asset_class", "")).strip().lower()
+        # global_assets_daily also backs company equity history. Keep those
+        # out of the global-context family; otherwise arbitrary other stocks
+        # would silently enter the macro/global relationship graph.
+        if asset_class in {"equity", "stock", "company", "share"}:
+            continue
+        rows = _table_rows(
+            get_global_asset_history(
+                ticker,
+                start_date=start_date,
+                end_date=end_date,
+            )
+        )
+        if rows:
+            result[ticker] = rows
+    return result
 
 
 def _build_table_outcome(
@@ -317,6 +573,10 @@ def _prediction_dates(
         raise ValueError(
             f"Unsupported analysis timeframe: {analysis_timeframe}"
         )
+    if step_trading_days < 1:
+        raise ValueError("step_trading_days must be >= 1")
+    if max_folds < 1:
+        raise ValueError("max_folds must be >= 1")
 
     timeframe_months = TIMEFRAME_MONTHS[analysis_timeframe]
     min_start = rows[0]["report_date"] + relativedelta(
@@ -337,22 +597,166 @@ def _prediction_dates(
     if not candidates:
         return []
 
-    # Use evenly spaced trading-day observations rather than a fixed
-    # calendar-window training period. The last folds are retained so the
-    # test reaches the current data horizon.
     stepped = candidates[::max(1, step_trading_days)]
     return stepped[-max_folds:]
 
 
+def _current_membership(ticker: str) -> tuple[str | None, str | None, list[str], list[str]]:
+    from data_access.metadata import (
+        get_companies_by_industry,
+        get_companies_by_sector,
+        get_company,
+    )
+
+    company = get_company(ticker)
+    if company is None:
+        raise RuntimeError(f"Ticker {ticker!r} not found in market_metadata.")
+
+    industry = company.get("Industry")
+    sector = company.get("Sector")
+
+    industry_constituents = [
+        str(row.get("Ticker"))
+        for row in get_companies_by_industry(industry)
+        if row.get("Ticker")
+    ] if industry else []
+
+    sector_constituents = [
+        str(row.get("Ticker"))
+        for row in get_companies_by_sector(sector)
+        if row.get("Ticker")
+    ] if sector else []
+
+    return industry, sector, sorted(set(industry_constituents)), sorted(set(sector_constituents))
+
+
+def _build_complete_state_atoms(
+    *,
+    ticker: str,
+    benchmark: str,
+    prediction_date: date,
+    analysis_start: date,
+    company_rows: list[dict[str, Any]],
+    benchmark_rows: list[dict[str, Any]],
+    macro_histories: dict[str, list[dict[str, Any]]],
+    global_histories: dict[str, list[dict[str, Any]]],
+    industry: str | None,
+    sector: str | None,
+    industry_constituents: list[str],
+    sector_constituents: list[str],
+) -> tuple[dict[str, str], list[str], list[str]]:
+    """
+    Build the real Phase 4 state surface from the existing Phase 3 engines.
+
+    Historical financial states are intentionally NOT emitted into the
+    relationship panel because the OLAP schema does not carry publication
+    timestamps. Their absence is reported as a timing limitation rather than
+    being treated as missing data or silently backdated.
+    """
+    from analysis.group_state import build_group_state
+
+    states: dict[str, str] = {}
+    limitations: list[str] = []
+
+    selected_company = _subset_table(company_rows, analysis_start, prediction_date)
+    historical_company = _subset_table(company_rows, company_rows[0]["report_date"], prediction_date)
+    states.update(
+        _build_company_market_atoms(
+            ticker=ticker,
+            selected_table=selected_company,
+            historical_table=historical_company,
+        )
+    )
+
+    benchmark_selected = [
+        row for row in benchmark_rows
+        if analysis_start <= row["report_date"] <= prediction_date
+    ]
+    benchmark_historical = [
+        row for row in benchmark_rows
+        if row["report_date"] <= prediction_date
+    ]
+    states.update(
+        _build_generic_market_atoms(
+            "benchmark",
+            benchmark,
+            benchmark_selected,
+            benchmark_historical,
+        )
+    )
+
+    states.update(
+        _build_macro_atoms(
+            macro_histories,
+            analysis_start,
+            prediction_date,
+        )
+    )
+
+    states.update(
+        _build_global_atoms(
+            global_histories,
+            analysis_start,
+            prediction_date,
+        )
+    )
+
+    benchmark_table = pa.Table.from_pylist(benchmark_historical) if benchmark_historical else None
+
+    if industry and industry_constituents:
+        industry_state = build_group_state(
+            group_type="industry",
+            group_name=industry,
+            constituents=industry_constituents,
+            analysis_start_date=analysis_start,
+            analysis_end_date=prediction_date,
+            benchmark_history=benchmark_table,
+        )
+        for metric, metric_state in industry_state.market_states.items():
+            label = _state_label(metric_state)
+            if label and not label.startswith("Unknown"):
+                states[f"industry.market.{metric}"] = label
+        limitations.extend(industry_state.limitations)
+
+    if sector and sector_constituents:
+        sector_state = build_group_state(
+            group_type="sector",
+            group_name=sector,
+            constituents=sector_constituents,
+            analysis_start_date=analysis_start,
+            analysis_end_date=prediction_date,
+            benchmark_history=benchmark_table,
+        )
+        for metric, metric_state in sector_state.market_states.items():
+            label = _state_label(metric_state)
+            if label and not label.startswith("Unknown"):
+                states[f"sector.market.{metric}"] = label
+        limitations.extend(sector_state.limitations)
+
+    # Historical financial states are structurally available in Phase 3, but
+    # they cannot be admitted here without a verified information-availability
+    # timestamp. Record the limitation once per snapshot.
+    limitations.append(
+        "Historical company/industry/sector financial states are excluded from "
+        "the relationship panel because OLAP ReportDate is accounting period end, "
+        "not verified publication/availability date."
+    )
+
+    return states, limitations, list(FINANCIAL_TIMING_LIMITED_FAMILIES)
+
+
 def build_real_olap_relationship_panel(
     config: RealOLAPValidationConfig,
-) -> tuple[list[HistoricalRelationshipObservation], dict[str, int], date | None]:
+) -> tuple[list[HistoricalRelationshipObservation], dict[str, Any], date | None]:
     """
     Build a real historical Phase 3-state / Phase 4-outcome panel.
 
-    The only database interaction occurs through the existing Phase 2
-    repositories. State calculation is delegated to the existing Phase 3
-    market-state engine.
+    The adapter now exposes the complete *time-safe* real state surface:
+        company.market, industry.market, sector.market, macro, global,
+        benchmark.
+
+    Financial families are wired as a known timing limitation rather than
+    backdated into the historical relationship panel.
     """
     from data_access.market import get_daily_history
 
@@ -378,6 +782,20 @@ def build_real_olap_relationship_panel(
             f"No real OLAP benchmark history found for {config.benchmark!r}."
         )
 
+    industry, sector, industry_constituents, sector_constituents = _current_membership(config.ticker)
+
+    macro_histories = _load_all_macro_histories(
+        earliest_date,
+        latest_market_date,
+        config.benchmark,
+    )
+    global_histories = _load_global_histories(
+        earliest_date,
+        latest_market_date,
+        config.benchmark,
+        config.ticker,
+    )
+
     dates = _prediction_dates(
         company_rows,
         config.analysis_timeframe,
@@ -392,45 +810,40 @@ def build_real_olap_relationship_panel(
     skipped_no_outcome = 0
     state_future_violations = 0
     outcome_temporal_violations = 0
+    financial_timing_limited_observations = 0
+    candidate_observations = len(dates)
 
     timeframe_months = TIMEFRAME_MONTHS[config.analysis_timeframe]
 
     for prediction_date in dates:
-        selected_start = prediction_date + relativedelta(
+        analysis_start = prediction_date + relativedelta(
             days=-max(1, round(timeframe_months * 30.4375))
         )
 
-        selected_table = _subset_table(
-            company_rows,
-            selected_start,
-            prediction_date,
-        )
-        historical_table = _subset_table(
-            company_rows,
-            company_rows[0]["report_date"],
-            prediction_date,
+        states, limitations, timing_limited = _build_complete_state_atoms(
+            ticker=config.ticker,
+            benchmark=config.benchmark,
+            prediction_date=prediction_date,
+            analysis_start=analysis_start,
+            company_rows=company_rows,
+            benchmark_rows=benchmark_rows,
+            macro_histories=macro_histories,
+            global_histories=global_histories,
+            industry=industry,
+            sector=sector,
+            industry_constituents=industry_constituents,
+            sector_constituents=sector_constituents,
         )
 
-        selected_dates = [
-            row["report_date"]
-            for row in selected_table.to_pylist()
-            if row.get("report_date") is not None
-        ]
-        historical_dates = [
-            row["report_date"]
-            for row in historical_table.to_pylist()
-            if row.get("report_date") is not None
-        ]
-        if selected_dates and max(selected_dates) > prediction_date:
-            state_future_violations += 1
-        if historical_dates and max(historical_dates) > prediction_date:
-            state_future_violations += 1
+        if states:
+            state_dates = [
+                row["report_date"]
+                for row in company_rows
+                if row["report_date"] <= prediction_date
+            ]
+            if state_dates and max(state_dates) > prediction_date:
+                state_future_violations += 1
 
-        states = _build_state_atoms(
-            config.ticker,
-            selected_table,
-            historical_table,
-        )
         if not states:
             skipped_no_state += 1
             continue
@@ -444,6 +857,7 @@ def build_real_olap_relationship_panel(
             config.entry_mode,
             config.benchmark,
         )
+
         if (
             outcome.entry_date is not None
             and config.entry_mode == "next_trading_day"
@@ -461,6 +875,7 @@ def build_real_olap_relationship_panel(
             skipped_no_outcome += 1
             continue
 
+        financial_timing_limited_observations += len(timing_limited)
         snapshots.append(
             HistoricalStateSnapshot(
                 as_of_date=prediction_date,
@@ -468,7 +883,7 @@ def build_real_olap_relationship_panel(
                 target=config.ticker,
                 scope="company",
                 states=states,
-                limitations=(),
+                limitations=tuple(sorted(set(limitations))),
             )
         )
         outcomes.append(outcome)
@@ -485,7 +900,7 @@ def build_real_olap_relationship_panel(
         strict=True,
     )
 
-    stats = {
+    stats: dict[str, Any] = {
         "valid_pairs": panel.stats.valid_pairs,
         "skipped_no_outcome": skipped_no_outcome,
         "skipped_no_state": skipped_no_state,
@@ -493,6 +908,15 @@ def build_real_olap_relationship_panel(
         "skipped_identity_mismatch": panel.stats.skipped_identity_mismatch,
         "state_future_violations": state_future_violations,
         "outcome_temporal_violations": outcome_temporal_violations,
+        "candidate_observations": candidate_observations,
+        "financial_timing_limited_observations": financial_timing_limited_observations,
+        "timing_limited_families": FINANCIAL_TIMING_LIMITED_FAMILIES,
+        "industry": industry,
+        "sector": sector,
+        "industry_constituents": len(industry_constituents),
+        "sector_constituents": len(sector_constituents),
+        "macro_series": len(macro_histories),
+        "global_series": len(global_histories),
     }
     return list(panel.observations), stats, latest_market_date
 
@@ -502,25 +926,50 @@ def validate_real_olap_relationships(
 ) -> RealOLAPValidationResult:
     observations, stats, latest_market_date = build_real_olap_relationship_panel(config)
 
-    # Walk-forward validation re-discovers relationships inside every fold.
+    from .hardening_4_10 import audit_state_surface
+
+    combined_state_surface: dict[str, str] = {}
+    if observations:
+        combined_state_surface = observations[-1].states
+    surface_audit = audit_state_surface(
+        combined_state_surface,
+        EXPECTED_PHASE4_STATE_FAMILIES,
+    )
+
     engine = RelationshipDiscoveryEngine(
         max_order=3,
         min_observations=config.min_training_observations,
     )
-    result = validate_walk_forward_relationships(
-        observations=observations,
-        engine=engine,
-        min_training_observations=config.min_training_observations,
-    )
 
-    # All state/outcome temporal checks are performed while constructing
-    # the panel from real repository observations.
-    state_future_violations = stats.get("state_future_violations", 0)
-    outcome_temporal_violations = stats.get("outcome_temporal_violations", 0)
+    from .walk_forward_relationship import validate_walk_forward_relationships_hardened
+
+    if config.hardened_validation:
+        result = validate_walk_forward_relationships_hardened(
+            observations=observations,
+            engine=engine,
+            min_training_observations=config.min_training_observations,
+            purge_overlapping_labels=True,
+        )
+    else:
+        from .walk_forward_relationship import validate_walk_forward_relationships
+        result = validate_walk_forward_relationships(
+            observations=observations,
+            engine=engine,
+            min_training_observations=config.min_training_observations,
+        )
 
     first_prediction_date = min(
         (observation.as_of_date for observation in observations),
         default=None,
+    )
+
+    timing_limited = tuple(stats.get("timing_limited_families", ()))
+    broad_validated = (
+        not surface_audit.missing_families
+        and not timing_limited
+        and result.leakage_violations == 0
+        and stats.get("state_future_violations", 0) == 0
+        and stats.get("outcome_temporal_violations", 0) == 0
     )
 
     return RealOLAPValidationResult(
@@ -537,8 +986,27 @@ def validate_real_olap_relationships(
         method_b_hit_rate_pct=result.method_b.directional_hit_rate_pct,
         combined_hit_rate_pct=result.combined.directional_hit_rate_pct,
         leakage_violations=result.leakage_violations,
-        state_future_violations=state_future_violations,
-        outcome_temporal_violations=outcome_temporal_violations,
+        state_future_violations=stats.get("state_future_violations", 0),
+        outcome_temporal_violations=stats.get("outcome_temporal_violations", 0),
         latest_market_date=latest_market_date,
         first_prediction_date=first_prediction_date,
+        state_surface_coverage_pct=surface_audit.coverage_pct,
+        missing_state_families=surface_audit.missing_families,
+        timing_limited_state_families=timing_limited,
+        broad_relationship_surface_validated=broad_validated,
+        purged_training_observations=getattr(result, "purged_training_observations", 0),
+        unknown_overlap_observations=getattr(result, "unknown_overlap_observations", 0),
+        selection_candidate_evaluations=getattr(result, "selection_candidate_evaluations", 0),
+        selection_validated_predictions=getattr(result, "selection_validated_predictions", 0),
+        multiple_testing_controlled_folds=getattr(result, "multiple_testing_controlled_folds", 0),
+        method_a_directional_predictions=result.method_a.directional_predictions,
+        method_b_directional_predictions=result.method_b.directional_predictions,
+        combined_directional_predictions=result.combined.directional_predictions,
+        candidate_observations=stats.get("candidate_observations", len(observations)),
+        valid_state_observations=len(observations),
+        financial_timing_limited_observations=stats.get("financial_timing_limited_observations", 0),
+        industry_constituents=stats.get("industry_constituents", 0),
+        sector_constituents=stats.get("sector_constituents", 0),
+        macro_series=stats.get("macro_series", 0),
+        global_series=stats.get("global_series", 0),
     )

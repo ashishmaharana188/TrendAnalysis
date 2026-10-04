@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable
 
 from .relationship import RelationshipResult
@@ -24,6 +24,8 @@ class RelationshipRanking:
     stable_method_count: int
 
     rank_key: tuple
+    candidate_count: int = 0
+    ranking_basis: str = "in_sample_diagnostic"
 
     @property
     def validated_usefulness(self) -> bool:
@@ -42,6 +44,8 @@ class RelationshipRanking:
             "sample_count": self.sample_count,
             "stable_method_count": self.stable_method_count,
             "validated_usefulness": self.validated_usefulness,
+            "candidate_count": self.candidate_count,
+            "ranking_basis": self.ranking_basis,
             "methods": [item.as_dict() for item in self.method_results],
         }
 
@@ -85,15 +89,16 @@ def rank_relationships(
     Rank relationships using evidence hierarchy, without fixed indicator weights.
 
     Ordering logic:
-      1. Cross-method agreement.
-      2. Directional stability across methods.
-      3. Absolute empirical score.
-      4. Reliability.
-      5. Sample support.
-      6. Stability count.
+      1. Absolute empirical score.
+      2. Reliability.
+      3. Stability count.
+      4. Effective sample support.
+      5. Cross-method agreement as a secondary tie-breaker.
 
-    This is an evidence ranking only. It does not claim out-of-sample
-    predictive validity or create UP/SIDEWAYS/DOWN probabilities.
+    This is intentionally an in-sample diagnostic ranking. Method agreement
+    is not treated as intrinsically stronger evidence than effect magnitude
+    or support. Out-of-sample validation and multiple-testing control remain
+    separate.
     """
     grouped: dict[tuple, list[RelationshipResult]] = {}
 
@@ -130,17 +135,16 @@ def rank_relationships(
         sample_count = max(item.sample_count for item in ordered)
         stable_count = sum(1 for item in ordered if item.stable)
 
-        # Lexicographic evidence hierarchy avoids a manually weighted
-        # composite score. Method agreement is stronger evidence than merely
-        # having a numerically large in-sample score.
+        # Agreement is deliberately a secondary diagnostic. A relationship
+        # is not promoted simply because two heuristics happen to agree.
         rank_key = (
+            abs(best.score),
+            reliability,
+            stable_count,
+            sample_count,
             int(method_agreement),
             int(len(ordered) > 1),
             int(direction != "NEUTRAL"),
-            abs(best.score),
-            reliability,
-            sample_count,
-            stable_count,
         )
 
         rankings.append(
@@ -156,8 +160,15 @@ def rank_relationships(
                 sample_count=sample_count,
                 stable_method_count=stable_count,
                 rank_key=rank_key,
+                candidate_count=0,
+                ranking_basis="in_sample_diagnostic",
             )
         )
 
+    candidate_count = len(grouped)
+    rankings = [
+        replace(item, candidate_count=candidate_count)
+        for item in rankings
+    ]
     rankings.sort(key=lambda item: item.rank_key, reverse=True)
     return rankings

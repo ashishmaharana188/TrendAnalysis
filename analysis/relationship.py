@@ -7,6 +7,12 @@ from math import exp, log1p, sqrt
 from statistics import median
 from typing import Any, Iterable
 
+from .hardening_4_10 import (
+    categorical_similarity,
+    split_stability,
+    weighted_median,
+)
+
 
 # ============================================================
 # STRUCTURAL RELATIONSHIP RULES
@@ -24,6 +30,7 @@ ALLOWED_RELATIONSHIP_FAMILIES = {
     frozenset({"industry.market", "macro"}),
     frozenset({"industry.market", "global"}),
     frozenset({"sector.market", "benchmark"}),
+    frozenset({"sector.financials", "sector.market"}),
     frozenset({"sector.market", "macro"}),
     frozenset({"sector.market", "global"}),
 }
@@ -42,6 +49,7 @@ class HistoricalRelationshipObservation:
     stock_return_pct: float
     benchmark_return_pct: float | None
     relative_return_pct: float | None
+    outcome_end_date: date | None = None
 
 
 @dataclass(frozen=True)
@@ -74,6 +82,19 @@ class RelationshipResult:
     effective_sample_size: float | None = None
     weight_concentration: float | None = None
 
+    # Raw support retained for Phase 5 so the prediction layer can convert
+    # the exact Method A/B evidence into three-class probabilities without
+    # duplicating the Phase 4 algorithms.
+    supporting_observations: tuple[tuple[date, float], ...] = ()
+    supporting_weights: tuple[float, ...] = ()
+
+    # Phase 4.10 methodological diagnostics.
+    state_coverage_pct: float = 100.0
+    family_coverage_pct: float = 100.0
+    stability_score: float = 0.0
+    exact_condition_count: int | None = None
+    parameter_provenance: tuple[tuple[str, date | None, date | None], ...] = ()
+
     def as_dict(self) -> dict[str, Any]:
         return {
             "method": self.method,
@@ -93,6 +114,20 @@ class RelationshipResult:
             "weighted_positive_rate_pct": self.weighted_positive_rate_pct,
             "effective_sample_size": self.effective_sample_size,
             "weight_concentration": self.weight_concentration,
+            "supporting_observation_count": len(self.supporting_observations),
+            "supporting_weight_count": len(self.supporting_weights),
+            "state_coverage_pct": self.state_coverage_pct,
+            "family_coverage_pct": self.family_coverage_pct,
+            "stability_score": self.stability_score,
+            "exact_condition_count": self.exact_condition_count,
+            "parameter_provenance": [
+                {
+                    "name": name,
+                    "fit_start_date": fit_start,
+                    "fit_end_date": fit_end,
+                }
+                for name, fit_start, fit_end in self.parameter_provenance
+            ],
         }
 
 
@@ -428,6 +463,9 @@ class RelationshipDiscoveryEngine:
         self,
         max_order: int = 2,
         min_observations: int = 5,
+        min_state_coverage_pct: float = 75.0,
+        min_family_coverage_pct: float = 75.0,
+        stability_sem_multiplier: float = 2.0,
     ) -> None:
         if max_order < 1:
             raise ValueError("max_order must be >= 1")
@@ -437,8 +475,18 @@ class RelationshipDiscoveryEngine:
                 "min_observations must be >= 1"
             )
 
+        if not 0.0 < min_state_coverage_pct <= 100.0:
+            raise ValueError("min_state_coverage_pct must be in (0, 100]")
+        if not 0.0 < min_family_coverage_pct <= 100.0:
+            raise ValueError("min_family_coverage_pct must be in (0, 100]")
+        if stability_sem_multiplier <= 0.0:
+            raise ValueError("stability_sem_multiplier must be > 0")
+
         self.max_order = max_order
         self.min_observations = min_observations
+        self.min_state_coverage_pct = float(min_state_coverage_pct)
+        self.min_family_coverage_pct = float(min_family_coverage_pct)
+        self.stability_sem_multiplier = float(stability_sem_multiplier)
 
     def prepare_history(
         self,
@@ -525,47 +573,33 @@ class RelationshipDiscoveryEngine:
 
         def similarity(
             observation: HistoricalRelationshipObservation,
-        ) -> float:
-            family_scores: list[float] = []
-
-            for family_features in families.values():
-                numerator = 0.0
-                denominator = 0.0
-
-                for feature in family_features:
-                    weight = feature_weights[feature]
-                    observed_state = observation.states.get(feature)
-
-                    # Missing historical state means the variable is not
-                    # comparable for this observation. It is not a mismatch.
-                    if observed_state is None:
-                        continue
-
-                    denominator += weight
-
-                    if observed_state == current_states[feature]:
-                        numerator += weight
-
-                if denominator > 0.0:
-                    family_scores.append(
-                        numerator / denominator
-                    )
-
-            if not family_scores:
-                return 0.0
-
-            return sum(family_scores) / len(family_scores)
+        ) -> tuple[float, float, float]:
+            diagnostics = categorical_similarity(
+                current_states=current_states,
+                observed_states=observation.states,
+                feature_weights=feature_weights,
+                family_lookup=_family,
+            )
+            return (
+                diagnostics.score,
+                diagnostics.state_coverage_pct,
+                diagnostics.family_coverage_pct,
+            )
 
         scored = [
-            (observation, similarity(observation))
+            (observation, *similarity(observation))
             for observation in history
         ]
 
-        # Only positive-similarity observations are genuinely comparable.
+        # A historical row must be sufficiently comparable before it may
+        # influence nearest-neighbour selection. Missingness now lowers
+        # similarity and is prevented from becoming a similarity advantage.
         scored = [
             item
             for item in scored
             if item[1] > 0.0
+            and item[2] >= self.min_state_coverage_pct
+            and item[3] >= self.min_family_coverage_pct
         ]
 
         if len(scored) < self.min_observations:
@@ -606,6 +640,14 @@ class RelationshipDiscoveryEngine:
             item[1]
             for item in scored[:neighbour_count]
         ]
+        neighbour_coverages = [
+            item[2]
+            for item in scored[:neighbour_count]
+        ]
+        neighbour_family_coverages = [
+            item[3]
+            for item in scored[:neighbour_count]
+        ]
 
         result = _summary_result(
             method="A",
@@ -631,27 +673,11 @@ class RelationshipDiscoveryEngine:
             key=lambda observation: observation.as_of_date,
         )
 
-        stable = False
-        if len(ordered_neighbours) >= 4:
-            midpoint = len(ordered_neighbours) // 2
-            first_half = ordered_neighbours[:midpoint]
-            second_half = ordered_neighbours[midpoint:]
-
-            first_mean = sum(
-                item.stock_return_pct
-                for item in first_half
-            ) / len(first_half)
-
-            second_mean = sum(
-                item.stock_return_pct
-                for item in second_half
-            ) / len(second_half)
-
-            stable = (
-                (first_mean == 0.0 and second_mean == 0.0)
-                or (first_mean > 0.0 and second_mean > 0.0)
-                or (first_mean < 0.0 and second_mean < 0.0)
-            )
+        stability = split_stability(
+            [item.stock_return_pct for item in ordered_neighbours],
+            sem_multiplier=self.stability_sem_multiplier,
+        )
+        stable = stability.stable
 
         # Similarity is an evidence-quality multiplier. It is deliberately
         # normalized to [0, 1] and does not assign bullish/bearish meaning.
@@ -660,6 +686,13 @@ class RelationshipDiscoveryEngine:
         )
 
         adjusted_score = result.score * mean_similarity
+        fit_dates = [item.as_of_date for item in history]
+        fit_start = min(fit_dates) if fit_dates else None
+        fit_end = max(fit_dates) if fit_dates else None
+        parameter_provenance = (
+            ("state_relevance_frequency", fit_start, fit_end),
+            ("method_a_adaptive_neighbor_count", fit_start, fit_end),
+        )
 
         return [
             RelationshipResult(
@@ -667,6 +700,17 @@ class RelationshipDiscoveryEngine:
                     **result.__dict__,
                     "score": adjusted_score,
                     "stable": stable,
+                    "supporting_observations": tuple(
+                        (item.as_of_date, float(item.stock_return_pct))
+                        for item in neighbours
+                    ),
+                    "supporting_weights": tuple(
+                        1.0 for _ in neighbours
+                    ),
+                    "state_coverage_pct": sum(neighbour_coverages) / len(neighbour_coverages),
+                    "family_coverage_pct": sum(neighbour_family_coverages) / len(neighbour_family_coverages),
+                    "stability_score": stability.stability_score,
+                    "parameter_provenance": parameter_provenance,
                 }
             )
         ]
@@ -681,108 +725,74 @@ class RelationshipDiscoveryEngine:
         history: list[HistoricalRelationshipObservation],
     ) -> list[RelationshipResult]:
         """
-        Method B: full historical outcome distribution with adaptive
-        current-condition weighting.
+        Method B: weighted historical distribution conditioned on the current
+        state.
 
-        Unlike Method A, Method B does not select a nearest-neighbour
-        subset. Every valid historical observation remains in the
-        distribution. Observations receive higher/lower relevance based
-        on how strongly their candidate feature states agree with the
-        current condition.
-
-        The weighting is learned from the observed state frequencies and
-        structural family coverage. It does not assign a permanent
-        bullish/bearish weight to any variable.
+        The estimator is explicitly: ``P(Y | X ~= x)``. Every reported
+        distribution statistic is calculated from the same weighted population.
+        Exact condition matches are retained only as a secondary diagnostic and
+        never define the primary sample or its summary statistics.
         """
         if not current_states or not history:
             return []
 
         baseline = history
         features = list(current_states.keys())
-        candidates = _candidate_feature_sets(
-            features,
-            self.max_order,
-        )
+        candidates = _candidate_feature_sets(features, self.max_order)
         relevance = _adaptive_relevance_weights(history)
 
         results: list[RelationshipResult] = []
 
         for feature_set in candidates:
-            # Structural-family normalization prevents a family with more
-            # fields from mechanically receiving more influence.
-            family_groups: dict[str, list[str]] = {}
-            for feature in feature_set:
-                family_groups.setdefault(
-                    _family(feature),
-                    [],
-                ).append(feature)
+            feature_weights = {
+                feature: relevance.get(
+                    (feature, current_states[feature]),
+                    1.0,
+                )
+                for feature in feature_set
+            }
 
-            def observation_similarity(
-                observation: HistoricalRelationshipObservation,
-            ) -> float:
-                family_scores: list[float] = []
-
-                for family_features in family_groups.values():
-                    numerator = 0.0
-                    denominator = 0.0
-
-                    for feature in family_features:
-                        observed_state = observation.states.get(feature)
-                        current_state = current_states.get(feature)
-                        if observed_state is None or current_state is None:
-                            continue
-
-                        info_weight = relevance.get(
-                            (feature, current_state),
-                            1.0,
+            scored: list[tuple[HistoricalRelationshipObservation, float, float, float]] = []
+            for observation in history:
+                diagnostics = categorical_similarity(
+                    current_states={feature: current_states[feature] for feature in feature_set},
+                    observed_states=observation.states,
+                    feature_weights=feature_weights,
+                    family_lookup=_family,
+                )
+                if (
+                    diagnostics.state_coverage_pct >= self.min_state_coverage_pct
+                    and diagnostics.family_coverage_pct >= self.min_family_coverage_pct
+                ):
+                    scored.append(
+                        (
+                            observation,
+                            diagnostics.score,
+                            diagnostics.state_coverage_pct,
+                            diagnostics.family_coverage_pct,
                         )
-                        denominator += info_weight
+                    )
 
-                        if observed_state == current_state:
-                            numerator += info_weight
-
-                    if denominator > 0.0:
-                        family_scores.append(
-                            numerator / denominator
-                        )
-
-                if not family_scores:
-                    return 0.0
-
-                return sum(family_scores) / len(family_scores)
-
-            scored = [
-                (observation, observation_similarity(observation))
-                for observation in history
-            ]
-
-            comparable_scores = [score for _, score in scored if score > 0.0]
-            if len(comparable_scores) < self.min_observations:
+            if len(scored) < self.min_observations:
                 continue
 
-            # Full-distribution weighting. The exponential transform keeps
-            # all rows in the distribution while making stronger matches
-            # more relevant. The scale is data-derived from the candidate
-            # similarity distribution rather than a hard-coded tolerance.
-            similarity_values = [score for _, score in scored]
-            positive_similarity = [
-                score for score in similarity_values
-                if score > 0.0
-            ]
+            similarity_values = [item[1] for item in scored]
+            positive_similarity = [value for value in similarity_values if value > 0.0]
             similarity_scale = (
-                sum(positive_similarity) / len(positive_similarity)
+                median(positive_similarity)
                 if positive_similarity
                 else 1.0
             )
             similarity_scale = max(similarity_scale, 1e-9)
+            max_similarity = max(similarity_values)
 
+            # Stable softmax-style weighting avoids exponential overflow while
+            # preserving the intended relative relevance ordering. All valid
+            # comparable rows remain in the distribution.
             weighted_rows: list[tuple[HistoricalRelationshipObservation, float]] = []
-            for observation, similarity in scored:
-                # baseline weight keeps every valid outcome in the sample;
-                # relevance then tilts the contribution toward the current
-                # state without dropping dissimilar observations entirely.
+            for observation, similarity, _coverage, _family_coverage in scored:
                 weight = exp(
-                    similarity / similarity_scale
+                    (similarity - max_similarity) / similarity_scale
                 )
                 weighted_rows.append((observation, weight))
 
@@ -790,104 +800,110 @@ class RelationshipDiscoveryEngine:
             if total_weight <= 0.0:
                 continue
 
+            outcomes = [observation.stock_return_pct for observation, _ in weighted_rows]
+            weights = [weight for _, weight in weighted_rows]
             weighted_mean = sum(
-                observation.stock_return_pct * weight
-                for observation, weight in weighted_rows
+                outcome * weight
+                for outcome, weight in zip(outcomes, weights)
             ) / total_weight
-
+            weighted_median_value = weighted_median(outcomes, weights)
             weighted_positive_rate = (
                 sum(
                     weight
-                    for observation, weight in weighted_rows
-                    if observation.stock_return_pct > 0.0
+                    for outcome, weight in zip(outcomes, weights)
+                    if outcome > 0.0
                 )
                 / total_weight
             ) * 100.0
 
-            weight_square_sum = sum(
-                weight * weight
-                for _, weight in weighted_rows
-            )
+            weight_square_sum = sum(weight * weight for weight in weights)
             effective_sample_size = (
                 (total_weight * total_weight) / weight_square_sum
                 if weight_square_sum > 0.0
                 else 0.0
             )
+            weight_concentration = max(weights) / total_weight
 
-            weight_concentration = (
-                max(weight for _, weight in weighted_rows)
-                / total_weight
+            baseline_mean = (
+                sum(observation.stock_return_pct for observation in baseline)
+                / len(baseline)
             )
-
-            condition = _condition_key(
-                current_states,
-                feature_set,
-            )
-            if condition is None:
-                continue
-
-            # For Method B the matched subset is still used to report the
-            # observed conditional effect, while the weighted distribution
-            # is the primary method-specific signal.
-            matching = [
-                observation
-                for observation in history
-                if _match_condition(observation, condition)
-            ]
-            if len(matching) < self.min_observations:
-                continue
-
-            result = _summary_result(
-                method="B",
-                variables=feature_set,
-                condition=condition,
-                matching=matching,
-                baseline=baseline,
-            )
-            if result is None:
-                continue
-
-            weighted_lift = weighted_mean - result.baseline_mean_return_pct
             baseline_dispersion = sqrt(
                 sum(
-                    (observation.stock_return_pct - result.baseline_mean_return_pct) ** 2
+                    (observation.stock_return_pct - baseline_mean) ** 2
                     for observation in baseline
                 )
                 / max(len(baseline), 1)
             )
+            weighted_lift = weighted_mean - baseline_mean
             weighted_effect_strength = (
                 abs(weighted_lift) / baseline_dispersion
                 if baseline_dispersion > 0.0
                 else 0.0
             )
-
             weighted_reliability = min(
                 1.0,
-                sqrt(
-                    effective_sample_size / max(len(baseline), 1)
-                ),
+                sqrt(effective_sample_size / max(len(baseline), 1)),
+            )
+            weighted_score = weighted_effect_strength * weighted_reliability
+
+            exact_condition = _condition_key(current_states, feature_set)
+            exact_condition_count = (
+                sum(
+                    1
+                    for observation, _weight in weighted_rows
+                    if exact_condition is not None
+                    and _match_condition(observation, exact_condition)
+                )
+                if exact_condition is not None
+                else 0
             )
 
-            weighted_score = (
-                weighted_effect_strength
-                * weighted_reliability
+            stability = split_stability(
+                outcomes,
+                sem_multiplier=self.stability_sem_multiplier,
             )
+            fit_dates = [item.as_of_date for item in history]
+            fit_start = min(fit_dates) if fit_dates else None
+            fit_end = max(fit_dates) if fit_dates else None
+            parameter_provenance = (
+                ("state_relevance_frequency", fit_start, fit_end),
+                ("method_b_similarity_scale", fit_start, fit_end),
+            )
+            mean_coverage = sum(item[2] for item in scored) / len(scored)
+            mean_family_coverage = sum(item[3] for item in scored) / len(scored)
 
             results.append(
                 RelationshipResult(
-                    **{
-                        **result.__dict__,
-                        "mean_return_pct": weighted_mean,
-                        "lift_pct": weighted_lift,
-                        "positive_rate_pct": weighted_positive_rate,
-                        "effect_strength": weighted_effect_strength,
-                        "reliability": weighted_reliability,
-                        "score": weighted_score,
-                        "weighted_mean_return_pct": weighted_mean,
-                        "weighted_positive_rate_pct": weighted_positive_rate,
-                        "effective_sample_size": effective_sample_size,
-                        "weight_concentration": weight_concentration,
-                    }
+                    method="B",
+                    variables=feature_set,
+                    condition=exact_condition or (),
+                    sample_count=len(weighted_rows),
+                    mean_return_pct=weighted_mean,
+                    median_return_pct=weighted_median_value,
+                    baseline_mean_return_pct=baseline_mean,
+                    lift_pct=weighted_lift,
+                    positive_rate_pct=weighted_positive_rate,
+                    effect_strength=weighted_effect_strength,
+                    reliability=weighted_reliability,
+                    score=weighted_score,
+                    stable=stability.stable,
+                    weighted_mean_return_pct=weighted_mean,
+                    weighted_positive_rate_pct=weighted_positive_rate,
+                    effective_sample_size=effective_sample_size,
+                    weight_concentration=weight_concentration,
+                    supporting_observations=tuple(
+                        (item.as_of_date, float(item.stock_return_pct))
+                        for item, _weight in weighted_rows
+                    ),
+                    supporting_weights=tuple(
+                        float(weight) for _item, weight in weighted_rows
+                    ),
+                    state_coverage_pct=mean_coverage,
+                    family_coverage_pct=mean_family_coverage,
+                    stability_score=stability.stability_score,
+                    exact_condition_count=exact_condition_count,
+                    parameter_provenance=parameter_provenance,
                 )
             )
 

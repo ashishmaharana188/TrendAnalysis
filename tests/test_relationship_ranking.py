@@ -101,6 +101,51 @@ def main() -> None:
     assert second.method_agreement is False
     assert second.direction == "NEGATIVE"
 
+
+    # Agreement is no longer a primary promotion rule. A materially stronger
+    # single-method relationship can rank above a weak cross-method agreement.
+    strong_single = make_result(
+        "A",
+        ("company.financials.TotalRevenue", "company.market.price"),
+        (
+            "company.financials.TotalRevenue~=Rising / High",
+            "company.market.price~=Rising / High",
+        ),
+        score=1.20,
+        mean_return=4.0,
+        reliability=0.70,
+        sample_count=18,
+        stable=False,
+    )
+    weak_pair_a = make_result(
+        "A",
+        ("industry.market.group_index", "macro.Brent_Crude"),
+        (
+            "industry.market.group_index~=Rising / High",
+            "macro.Brent_Crude~=Rising / High",
+        ),
+        score=0.20,
+        mean_return=0.6,
+        reliability=0.90,
+        sample_count=40,
+        stable=True,
+    )
+    weak_pair_b = make_result(
+        "B",
+        ("industry.market.group_index", "macro.Brent_Crude"),
+        (
+            "industry.market.group_index=Rising / High",
+            "macro.Brent_Crude=Rising / High",
+        ),
+        score=0.15,
+        mean_return=0.5,
+        reliability=0.85,
+        sample_count=42,
+        stable=True,
+    )
+    revised = rank_relationships([strong_single, weak_pair_a, weak_pair_b])
+    assert revised[0].variables == strong_single.variables
+
     # Deterministic ordering and date-independent behaviour.
     assert date(2026, 10, 4) == date(2026, 10, 4)
 
