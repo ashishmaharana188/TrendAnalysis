@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from math import isfinite, log
 from typing import Any, Callable, Iterable, Sequence
+import logging
+import time
 
 from .outcome_labels import OutcomeClass, classify_return
 from .prediction import PredictionEngine, PredictionResult
@@ -19,6 +21,23 @@ if TYPE_CHECKING:
 
 
 PredictionTrend = str
+
+_LOGGER = logging.getLogger("trendanalysis.phase5.real_olap")
+
+def _configure_phase5_progress(enabled: bool) -> None:
+    if not enabled:
+        return
+    if not _LOGGER.handlers:
+        handler = logging.StreamHandler()
+        handler.setFormatter(logging.Formatter("[Phase 5.8] %(message)s"))
+        _LOGGER.addHandler(handler)
+    _LOGGER.setLevel(logging.INFO)
+    _LOGGER.propagate = False
+
+def _phase5_progress(enabled: bool, message: str, *args: Any) -> None:
+    if enabled:
+        _LOGGER.info(message, *args)
+
 
 
 @dataclass(frozen=True)
@@ -267,8 +286,33 @@ def validate_real_olap_predictions(
     observations = sorted(observations, key=lambda row: _as_date(row.as_of_date))
     candidate_predictions = len(observations)
 
+    _configure_phase5_progress(getattr(config, "progress_logging", True))
     if prediction_engine is None:
-        prediction_engine = PredictionEngine(min_threshold_observations=config.min_training_observations)
+        progress_every_candidates = max(1, int(getattr(config, "relationship_progress_every_candidates", 500)))
+
+        def _relationship_progress(message: str) -> None:
+            _phase5_progress(getattr(config, "progress_logging", True), message)
+
+        from .relationship import RelationshipDiscoveryEngine
+        relationship_engine = RelationshipDiscoveryEngine(
+            max_order=3,
+            min_observations=config.min_training_observations,
+            adaptive_higher_order=bool(getattr(config, "adaptive_relationship_search", True)),
+            progress_callback=_relationship_progress,
+            progress_every_candidates=progress_every_candidates,
+            candidate_batch_size=int(getattr(config, "relationship_candidate_batch_size", 512)),
+            retain_supporting_data=False,
+        )
+        prediction_engine = PredictionEngine(
+            relationship_engine=relationship_engine,
+            min_threshold_observations=config.min_training_observations,
+        )
+
+    _phase5_progress(
+        getattr(config, "progress_logging", True),
+        "Prediction validation start | folds=%d | exhaustive_search=YES | batch=%d",
+        candidate_predictions, int(getattr(config, "relationship_candidate_batch_size", 512)),
+    )
 
     folds: list[PredictionFoldResult] = []
     skipped_threshold_limited = 0
@@ -276,7 +320,7 @@ def validate_real_olap_predictions(
     skipped_invalid_actual = 0
     conviction_counts = {key: 0 for key in ("STRONG", "MODERATE", "LOW", "NONE")}
 
-    for observation in observations:
+    for fold_index, observation in enumerate(observations, start=1):
         cutoff = _as_date(observation.as_of_date)
         actual_return = observation.stock_return_pct
         if actual_return is None:
@@ -290,6 +334,14 @@ def validate_real_olap_predictions(
         if not isfinite(actual_numeric):
             skipped_invalid_actual += 1
             continue
+
+        fold_started = time.perf_counter()
+        if fold_index == 1 or fold_index % max(1, getattr(config, "progress_every", 10)) == 0 or fold_index == candidate_predictions:
+            _phase5_progress(
+                getattr(config, "progress_logging", True),
+                "Fold start %d/%d | prediction_date=%s | prior_completed=%d",
+                fold_index, candidate_predictions, cutoff, len(folds),
+            )
 
         result = prediction_engine.predict(
             target=observation.target,
@@ -338,6 +390,18 @@ def validate_real_olap_predictions(
                 hit=hit,
             )
         )
+
+
+        if fold_index == 1 or fold_index % max(1, getattr(config, "progress_every", 10)) == 0 or fold_index == candidate_predictions:
+            _phase5_progress(
+                getattr(config, "progress_logging", True),
+                "Fold complete %d/%d | elapsed=%.2fs | predicted=%s | A=%s B=%s | training=%d | candidates=%d",
+                fold_index, candidate_predictions, time.perf_counter() - fold_started, result.trend,
+                result.method_a.trend if result.method_a else None,
+                result.method_b.trend if result.method_b else None,
+                result.training_observations,
+                (result.provenance_audit.relationship_candidate_count if result.provenance_audit else 0),
+            )
 
     method_a = _summary("A", folds, lambda fold: fold.method_a_trend)
     method_b = _summary("B", folds, lambda fold: fold.method_b_trend)

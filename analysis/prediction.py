@@ -343,6 +343,10 @@ class PredictionEngine:
             key=lambda item: abs(item.score),
             default=None,
         )
+        if best is not None and not best.supporting_observations:
+            materializer = getattr(self.relationship_engine, "materialize_support", None)
+            if materializer is not None:
+                best = materializer(best, history)
         probability = build_method_b_probability(best, thresholds)
 
         # Phase 5.3 constructs the coherent Method B weighted empirical

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
-from itertools import combinations
 from math import exp, log1p, sqrt
 from statistics import median
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
+
+import numpy as np
 
 from .hardening_4_10 import (
     categorical_similarity,
@@ -18,54 +19,13 @@ from .hardening_4_10 import (
 # STRUCTURAL RELATIONSHIP RULES
 # ============================================================
 
-# These are structural/domain relationships, not economic claims.
-# Example: industry.market may interact with macro.Brent_Crude;
-# whether it is actually useful is discovered from history.
-
-ALLOWED_RELATIONSHIP_FAMILIES = {
-    frozenset({"company.financials", "company.market"}),
-    frozenset({"company.financials", "industry.market"}),
-    frozenset({"industry.financials", "industry.market"}),
-    frozenset({"industry.market", "sector.market"}),
-    frozenset({"industry.market", "macro"}),
-    frozenset({"industry.market", "global"}),
-    frozenset({"sector.market", "benchmark"}),
-    frozenset({"sector.financials", "sector.market"}),
-    frozenset({"sector.market", "macro"}),
-    frozenset({"sector.market", "global"}),
-    # Institutional / derivatives / flow branches are structural inputs.
-    # Their directional meaning is still learned empirically in Phase 4.
-    frozenset({"institutional", "company.market"}),
-    frozenset({"institutional", "industry.market"}),
-    frozenset({"institutional", "sector.market"}),
-    frozenset({"institutional", "macro"}),
-    frozenset({"institutional", "global"}),
-    frozenset({"institutional", "benchmark"}),
-    frozenset({"institutional", "derivatives"}),
-    frozenset({"institutional", "microstructure"}),
-    frozenset({"institutional", "trade_events"}),
-    frozenset({"derivatives", "company.market"}),
-    frozenset({"derivatives", "industry.market"}),
-    frozenset({"derivatives", "sector.market"}),
-    frozenset({"derivatives", "macro"}),
-    frozenset({"derivatives", "global"}),
-    frozenset({"derivatives", "benchmark"}),
-    frozenset({"derivatives", "microstructure"}),
-    frozenset({"derivatives", "trade_events"}),
-    frozenset({"microstructure", "company.market"}),
-    frozenset({"microstructure", "industry.market"}),
-    frozenset({"microstructure", "sector.market"}),
-    frozenset({"microstructure", "macro"}),
-    frozenset({"microstructure", "global"}),
-    frozenset({"microstructure", "benchmark"}),
-    frozenset({"microstructure", "trade_events"}),
-    frozenset({"trade_events", "company.market"}),
-    frozenset({"trade_events", "industry.market"}),
-    frozenset({"trade_events", "sector.market"}),
-    frozenset({"trade_events", "macro"}),
-    frozenset({"trade_events", "global"}),
-    frozenset({"trade_events", "benchmark"}),
-}
+from .relationship_graph import (
+    ALLOWED_RELATIONSHIP_FAMILIES,
+    candidate_feature_sets,
+    compatible_pair,
+    family_for_feature,
+    structurally_connected,
+)
 
 
 @dataclass(frozen=True)
@@ -174,32 +134,16 @@ def _as_date(value: str | date | datetime) -> date:
 
 
 def _family(feature: str) -> str:
-    """Map a state path to a structural family."""
-
-    parts = feature.split(".")
-
-    if len(parts) < 2:
-        return parts[0]
-
-    return f"{parts[0]}.{parts[1]}"
+    """Compatibility wrapper for the canonical family registry."""
+    return family_for_feature(feature)
 
 
 def _compatible_pair(
     left: str,
     right: str,
 ) -> bool:
-    left_family = _family(left)
-    right_family = _family(right)
-
-    if left_family == right_family:
-        return False
-
-    families = frozenset({
-        left_family,
-        right_family,
-    })
-
-    return families in ALLOWED_RELATIONSHIP_FAMILIES
+    """Compatibility wrapper around the canonical graph implementation."""
+    return compatible_pair(left, right)
 
 
 def _flatten_states(
@@ -344,6 +288,53 @@ def _condition_matches_current(
     return True
 
 
+
+
+def _fast_candidate_similarity(
+    feature_set: tuple[str, ...],
+    current_states: dict[str, str],
+    observed_states: dict[str, str],
+    feature_weights: dict[str, float],
+) -> tuple[float, float, float]:
+    """Fast equivalent of ``categorical_similarity`` for graph-valid candidates.
+
+    The canonical relationship graph guarantees that a valid candidate contains
+    at most one feature from each structural family. In that case the generic
+    family-normalized similarity reduces exactly to: matched family count /
+    candidate family count, with coverage computed from the observed members.
+    Keeping this path local to candidate evaluation removes repeated allocation of
+    tiny dictionaries inside the Phase 5 walk-forward loop without changing the
+    mathematical definition.
+    """
+    family_count = len(feature_set)
+    if family_count == 0:
+        return 0.0, 0.0, 0.0
+
+    total_weight = 0.0
+    compared_weight = 0.0
+    matched_families = 0
+    observed_families = 0
+
+    for feature in feature_set:
+        weight = max(float(feature_weights.get(feature, 1.0)), 0.0)
+        total_weight += weight
+        observed = observed_states.get(feature)
+        if observed is None:
+            continue
+        compared_weight += weight
+        observed_families += 1
+        if observed == current_states[feature]:
+            matched_families += 1
+
+    if total_weight <= 0.0:
+        return 0.0, 0.0, 0.0
+
+    score = matched_families / family_count
+    state_coverage_pct = compared_weight / total_weight * 100.0
+    family_coverage_pct = observed_families / family_count * 100.0
+    return score, state_coverage_pct, family_coverage_pct
+
+
 def _summary_result(
     method: str,
     variables: tuple[str, ...],
@@ -421,60 +412,16 @@ def _summary_result(
 
 
 def _structurally_connected(features: tuple[str, ...]) -> bool:
-    """Return True when the selected families form a connected graph."""
-
-    families = {_family(feature) for feature in features}
-
-    if len(families) != len(features):
-        # Do not duplicate the same structural family in one combination.
-        return False
-
-    if len(families) <= 1:
-        return False
-
-    remaining = set(families)
-    visited = {next(iter(remaining))}
-
-    changed = True
-    while changed:
-        changed = False
-        for left in tuple(visited):
-            for right in tuple(remaining - visited):
-                if frozenset({left, right}) in ALLOWED_RELATIONSHIP_FAMILIES:
-                    visited.add(right)
-                    changed = True
-
-    return visited == families
+    """Compatibility wrapper around the canonical structural graph."""
+    return structurally_connected(features)
 
 
 def _candidate_feature_sets(
     features: Iterable[str],
     max_order: int,
 ) -> list[tuple[str, ...]]:
-    features = sorted(set(features))
-
-    candidates: list[tuple[str, ...]] = []
-
-    # Individual variables are always allowed.
-    for feature in features:
-        candidates.append((feature,))
-
-    # Pairs remain explicitly constrained by the structural graph.
-    if max_order >= 2:
-        for left, right in combinations(features, 2):
-            if _compatible_pair(left, right):
-                candidates.append((left, right))
-
-    # Higher-order combinations are generated only when the family graph
-    # is connected and every member belongs to a distinct family. This keeps
-    # the search structurally bounded rather than allowing arbitrary feature
-    # cartesian products.
-    for order in range(3, max_order + 1):
-        for candidate in combinations(features, order):
-            if _structurally_connected(candidate):
-                candidates.append(candidate)
-
-    return candidates
+    """Compatibility wrapper around the single canonical candidate graph."""
+    return candidate_feature_sets(features, max_order)
 
 
 class RelationshipDiscoveryEngine:
@@ -498,6 +445,11 @@ class RelationshipDiscoveryEngine:
         min_state_coverage_pct: float = 75.0,
         min_family_coverage_pct: float = 75.0,
         stability_sem_multiplier: float = 2.0,
+        adaptive_higher_order: bool = False,
+        progress_callback: Callable[[str], None] | None = None,
+        progress_every_candidates: int = 1000,
+        candidate_batch_size: int = 512,
+        retain_supporting_data: bool = True,
     ) -> None:
         if max_order < 1:
             raise ValueError("max_order must be >= 1")
@@ -519,6 +471,15 @@ class RelationshipDiscoveryEngine:
         self.min_state_coverage_pct = float(min_state_coverage_pct)
         self.min_family_coverage_pct = float(min_family_coverage_pct)
         self.stability_sem_multiplier = float(stability_sem_multiplier)
+        self.adaptive_higher_order = bool(adaptive_higher_order)
+        self.progress_callback = progress_callback
+        self.progress_every_candidates = max(1, int(progress_every_candidates))
+        self.candidate_batch_size = max(32, int(candidate_batch_size))
+        self.retain_supporting_data = bool(retain_supporting_data)
+
+    def _progress(self, message: str) -> None:
+        if self.progress_callback is not None:
+            self.progress_callback(message)
 
     def prepare_history(
         self,
@@ -760,194 +721,400 @@ class RelationshipDiscoveryEngine:
         Method B: weighted historical distribution conditioned on the current
         state.
 
-        The estimator is explicitly: ``P(Y | X ~= x)``. Every reported
-        distribution statistic is calculated from the same weighted population.
-        Exact condition matches are retained only as a secondary diagnostic and
-        never define the primary sample or its summary statistics.
+        The candidate universe remains exhaustive for ``max_order``. The
+        performance implementation only changes *how* the exact statistics are
+        calculated: feature/state matches are materialized once, candidates are
+        evaluated in vectorized batches, and the outcome ordering is reused.
+        No candidate is pruned for performance.
         """
         if not current_states or not history:
             return []
 
         baseline = history
         features = list(current_states.keys())
-        candidates = _candidate_feature_sets(features, self.max_order)
         relevance = _adaptive_relevance_weights(history)
+        candidates = _candidate_feature_sets(features, self.max_order)
+        self._progress(
+            f"Method B search start | features={len(features)} | candidates={len(candidates)} | history={len(history)} | exhaustive=YES | batch={self.candidate_batch_size}"
+        )
+        if not candidates:
+            return []
 
+        n = len(history)
+        feature_index = {feature: idx for idx, feature in enumerate(features)}
+        match_matrix = np.zeros((len(features), n), dtype=np.uint8)
+        observed_matrix = np.zeros((len(features), n), dtype=np.uint8)
+        weight_vector = np.empty(len(features), dtype=np.float64)
+
+        # This is the only feature x history pass. All subsequent candidate
+        # calculations reuse these arrays.
+        for feature, idx in feature_index.items():
+            current_state = current_states[feature]
+            weight_vector[idx] = max(
+                float(relevance.get((feature, current_state), 1.0)),
+                0.0,
+            )
+            observed = np.fromiter(
+                (1 if observation.states.get(feature) is not None else 0 for observation in history),
+                dtype=np.uint8,
+                count=n,
+            )
+            matches = np.fromiter(
+                (1 if observation.states.get(feature) == current_state else 0 for observation in history),
+                dtype=np.uint8,
+                count=n,
+            )
+            observed_matrix[idx] = observed
+            match_matrix[idx] = matches
+
+        outcomes = np.asarray(
+            [float(observation.stock_return_pct) for observation in history],
+            dtype=np.float64,
+        )
+        outcome_order = np.argsort(outcomes, kind="stable")
+        ordered_outcomes = outcomes[outcome_order]
+        baseline_mean = float(np.mean(outcomes))
+        baseline_dispersion = float(np.sqrt(np.mean((outcomes - baseline_mean) ** 2)))
+        fit_dates = [item.as_of_date for item in history]
+        fit_start = min(fit_dates) if fit_dates else None
+        fit_end = max(fit_dates) if fit_dates else None
+        min_obs = self.min_observations
+        batch_size = self.candidate_batch_size
         results: list[RelationshipResult] = []
+        last_progress = 0
 
-        for feature_set in candidates:
-            feature_weights = {
-                feature: relevance.get(
-                    (feature, current_states[feature]),
+        processed_candidates = 0
+        orders = sorted({len(candidate) for candidate in candidates})
+        for order in orders:
+            order_candidates = [candidate for candidate in candidates if len(candidate) == order]
+            for batch_start in range(0, len(order_candidates), batch_size):
+                batch = order_candidates[batch_start:batch_start + batch_size]
+                batch_len = len(batch)
+
+                index_matrix = np.asarray(
+                    [[feature_index[feature] for feature in candidate] for candidate in batch],
+                    dtype=np.int32,
+                )
+                candidate_weights = weight_vector[index_matrix]
+    
+                # Shape: batch x observations. This exactly reproduces the scalar
+                # _fast_candidate_similarity calculations for graph-valid candidates.
+                similarity = (
+                    np.sum(match_matrix[index_matrix], axis=1, dtype=np.float64)
+                    / float(order)
+                )
+                compared_weight = np.sum(
+                    candidate_weights[:, :, None] * observed_matrix[index_matrix],
+                    axis=1,
+                    dtype=np.float64,
+                )
+                family_coverage_pct = (
+                    np.sum(observed_matrix[index_matrix], axis=1, dtype=np.float64)
+                    / float(order)
+                    * 100.0
+                )
+                total_candidate_weight = np.sum(candidate_weights, axis=1)
+                state_coverage_pct = np.divide(
+                    compared_weight,
+                    total_candidate_weight[:, None],
+                    out=np.zeros_like(compared_weight),
+                    where=total_candidate_weight[:, None] > 0.0,
+                ) * 100.0
+                valid_mask = (
+                    (state_coverage_pct >= self.min_state_coverage_pct)
+                    & (family_coverage_pct >= self.min_family_coverage_pct)
+                    & (total_candidate_weight[:, None] > 0.0)
+                )
+                valid_counts = np.count_nonzero(valid_mask, axis=1)
+                eligible_rows = valid_counts >= min_obs
+                if not np.any(eligible_rows):
+                    processed_candidates += batch_len
+                    if processed_candidates - last_progress >= self.progress_every_candidates or processed_candidates == len(candidates):
+                        self._progress(
+                            f"Method B candidate progress {processed_candidates}/{len(candidates)} | results={len(results)}"
+                        )
+                        last_progress = processed_candidates
+                    continue
+    
+                positive = np.where(
+                    valid_mask & (similarity > 0.0),
+                    similarity,
+                    np.nan,
+                )
+                with np.errstate(all="ignore"):
+                    scales = np.nanmedian(positive, axis=1)
+                scales = np.where(np.isfinite(scales), np.maximum(scales, 1e-9), 1.0)
+    
+                valid_max = np.max(
+                    np.where(valid_mask, similarity, -np.inf),
+                    axis=1,
+                )
+                weights_full = np.exp(
+                    (similarity - valid_max[:, None]) / scales[:, None]
+                )
+                weights_full *= valid_mask
+                total_weighted = np.sum(weights_full, axis=1)
+                usable = eligible_rows & (total_weighted > 0.0)
+                if not np.any(usable):
+                    processed_candidates += batch_len
+                    if processed_candidates - last_progress >= self.progress_every_candidates or processed_candidates == len(candidates):
+                        self._progress(
+                            f"Method B candidate progress {processed_candidates}/{len(candidates)} | results={len(results)}"
+                        )
+                        last_progress = processed_candidates
+                    continue
+    
+                weighted_mean = np.divide(
+                    weights_full @ outcomes,
+                    total_weighted,
+                    out=np.zeros_like(total_weighted),
+                    where=total_weighted > 0.0,
+                )
+                weighted_positive_rate = np.divide(
+                    weights_full @ (outcomes > 0.0).astype(np.float64),
+                    total_weighted,
+                    out=np.zeros_like(total_weighted),
+                    where=total_weighted > 0.0,
+                ) * 100.0
+                weight_square_sum = np.sum(weights_full * weights_full, axis=1)
+                effective_sample_size = np.divide(
+                    total_weighted * total_weighted,
+                    weight_square_sum,
+                    out=np.zeros_like(total_weighted),
+                    where=weight_square_sum > 0.0,
+                )
+                weight_concentration = np.divide(
+                    np.max(weights_full, axis=1),
+                    total_weighted,
+                    out=np.zeros_like(total_weighted),
+                    where=total_weighted > 0.0,
+                )
+    
+                ordered_weights = weights_full[:, outcome_order]
+                cumulative = np.cumsum(ordered_weights, axis=1)
+                half_threshold = total_weighted / 2.0
+                median_reached = cumulative >= half_threshold[:, None]
+                median_positions = np.argmax(median_reached, axis=1)
+                weighted_median_values = ordered_outcomes[median_positions]
+    
+                weighted_lift = weighted_mean - baseline_mean
+                weighted_effect_strength = np.divide(
+                    np.abs(weighted_lift),
+                    baseline_dispersion,
+                    out=np.zeros_like(weighted_lift),
+                    where=baseline_dispersion > 0.0,
+                )
+                weighted_reliability = np.minimum(
+                    1.0,
+                    np.sqrt(effective_sample_size / max(len(baseline), 1)),
+                )
+                weighted_score = weighted_effect_strength * weighted_reliability
+    
+                # Exact-condition counts use the comparable row mask, not positive
+                # floating weights, matching the scalar implementation.
+                exact_matches = np.all(
+                    match_matrix[index_matrix].astype(bool),
+                    axis=1,
+                ).sum(axis=1).astype(np.int64)
+    
+                # Vectorized split-half stability. This is exactly the same
+                # chronological split calculation as split_stability(), expressed
+                # on the batch masks to avoid another observation loop.
+                midpoint = n // 2
+                first_mask = valid_mask[:, :midpoint]
+                second_mask = valid_mask[:, midpoint:]
+                first_count = first_mask.sum(axis=1).astype(np.float64)
+                second_count = second_mask.sum(axis=1).astype(np.float64)
+                first_values = outcomes[:midpoint][None, :]
+                second_values = outcomes[midpoint:][None, :]
+                first_sum = np.sum(np.where(first_mask, first_values, 0.0), axis=1)
+                second_sum = np.sum(np.where(second_mask, second_values, 0.0), axis=1)
+                first_mean = np.divide(first_sum, first_count, out=np.zeros_like(first_sum), where=first_count > 0.0)
+                second_mean = np.divide(second_sum, second_count, out=np.zeros_like(second_sum), where=second_count > 0.0)
+                first_diff = np.where(first_mask, first_values - first_mean[:, None], 0.0)
+                second_diff = np.where(second_mask, second_values - second_mean[:, None], 0.0)
+                first_var = np.divide(
+                    np.sum(first_diff * first_diff, axis=1),
+                    np.maximum(first_count - 1.0, 1.0),
+                    out=np.zeros_like(first_count),
+                    where=first_count >= 2.0,
+                )
+                second_var = np.divide(
+                    np.sum(second_diff * second_diff, axis=1),
+                    np.maximum(second_count - 1.0, 1.0),
+                    out=np.zeros_like(second_count),
+                    where=second_count >= 2.0,
+                )
+                pooled_se = np.sqrt(
+                    first_var / np.maximum(first_count, 1.0)
+                    + second_var / np.maximum(second_count, 1.0)
+                )
+                mean_difference = np.abs(first_mean - second_mean)
+                sign_agreement = np.where(
+                    (first_mean == 0.0) | (second_mean == 0.0),
+                    (first_mean == second_mean),
+                    (first_mean > 0.0) == (second_mean > 0.0),
+                )
+                consistency = np.clip(
+                    1.0 - np.divide(
+                        mean_difference,
+                        np.maximum(self.stability_sem_multiplier * pooled_se, 1e-12),
+                    ),
+                    0.0,
                     1.0,
                 )
-                for feature in feature_set
-            }
-
-            scored: list[tuple[HistoricalRelationshipObservation, float, float, float]] = []
-            for observation in history:
-                diagnostics = categorical_similarity(
-                    current_states={feature: current_states[feature] for feature in feature_set},
-                    observed_states=observation.states,
-                    feature_weights=feature_weights,
-                    family_lookup=_family,
+                stability_scores = np.where(sign_agreement, consistency, 0.0)
+                stable_flags = (
+                    sign_agreement
+                    & (mean_difference <= self.stability_sem_multiplier * pooled_se)
+                    & (first_count >= 2.0)
+                    & (second_count >= 2.0)
                 )
-                if (
-                    diagnostics.state_coverage_pct >= self.min_state_coverage_pct
-                    and diagnostics.family_coverage_pct >= self.min_family_coverage_pct
-                ):
-                    scored.append(
-                        (
-                            observation,
-                            diagnostics.score,
-                            diagnostics.state_coverage_pct,
-                            diagnostics.family_coverage_pct,
+    
+                mean_coverage = np.divide(
+                    np.sum(np.where(valid_mask, state_coverage_pct, 0.0), axis=1),
+                    np.maximum(valid_counts, 1),
+                )
+                mean_family_coverage = np.divide(
+                    np.sum(np.where(valid_mask, family_coverage_pct, 0.0), axis=1),
+                    np.maximum(valid_counts, 1),
+                )
+    
+                for row_index, candidate in enumerate(batch):
+                    if not usable[row_index]:
+                        continue
+                    valid_indices = np.flatnonzero(valid_mask[row_index])
+                    condition = _condition_key(current_states, candidate) or ()
+                    results.append(
+                        RelationshipResult(
+                            method="B",
+                            variables=candidate,
+                            condition=condition,
+                            sample_count=int(valid_counts[row_index]),
+                            mean_return_pct=float(weighted_mean[row_index]),
+                            median_return_pct=float(weighted_median_values[row_index]),
+                            baseline_mean_return_pct=baseline_mean,
+                            lift_pct=float(weighted_lift[row_index]),
+                            positive_rate_pct=float(weighted_positive_rate[row_index]),
+                            effect_strength=float(weighted_effect_strength[row_index]),
+                            reliability=float(weighted_reliability[row_index]),
+                            score=float(weighted_score[row_index]),
+                            stable=bool(stable_flags[row_index]),
+                            weighted_mean_return_pct=float(weighted_mean[row_index]),
+                            weighted_positive_rate_pct=float(weighted_positive_rate[row_index]),
+                            effective_sample_size=float(effective_sample_size[row_index]),
+                            weight_concentration=float(weight_concentration[row_index]),
+                            supporting_observations=(
+                                tuple(
+                                    (history[index].as_of_date, float(outcomes[index]))
+                                    for index in valid_indices
+                                )
+                                if self.retain_supporting_data
+                                else ()
+                            ),
+                            supporting_weights=(
+                                tuple(
+                                    float(weight)
+                                    for weight in weights_full[row_index, valid_indices]
+                                )
+                                if self.retain_supporting_data
+                                else ()
+                            ),
+                            state_coverage_pct=float(mean_coverage[row_index]),
+                            family_coverage_pct=float(mean_family_coverage[row_index]),
+                            stability_score=float(stability_scores[row_index]),
+                            exact_condition_count=int(exact_matches[row_index]),
+                            parameter_provenance=(
+                                ("state_relevance_frequency", fit_start, fit_end),
+                                ("method_b_similarity_scale", fit_start, fit_end),
+                            ),
                         )
                     )
+    
+                processed_candidates += batch_len
+                if processed_candidates - last_progress >= self.progress_every_candidates or processed_candidates == len(candidates):
+                    self._progress(
+                        f"Method B candidate progress {processed_candidates}/{len(candidates)} | results={len(results)}"
+                    )
+                    last_progress = processed_candidates
+    
+        return results
 
-            if len(scored) < self.min_observations:
+    def materialize_support(
+        self,
+        result: RelationshipResult,
+        history: list[HistoricalRelationshipObservation],
+    ) -> RelationshipResult:
+        """Materialize exact support for one selected Method-B relationship."""
+        if result.method != "B" or result.supporting_observations:
+            return result
+        if not history or not result.variables:
+            return result
+
+        current_states: dict[str, str] = {}
+        for item in result.condition:
+            if "=" not in item:
                 continue
+            feature, state = item.split("=", 1)
+            current_states[feature] = state
+        if len(current_states) != len(result.variables):
+            return result
 
-            similarity_values = [item[1] for item in scored]
-            positive_similarity = [value for value in similarity_values if value > 0.0]
-            similarity_scale = (
-                median(positive_similarity)
-                if positive_similarity
-                else 1.0
+        relevance = _adaptive_relevance_weights(history)
+        feature_weights = {
+            feature: max(
+                float(relevance.get((feature, current_states[feature]), 1.0)),
+                0.0,
             )
-            similarity_scale = max(similarity_scale, 1e-9)
-            max_similarity = max(similarity_values)
+            for feature in result.variables
+        }
+        total_weight = sum(feature_weights.values())
+        if total_weight <= 0.0:
+            return result
 
-            # Stable softmax-style weighting avoids exponential overflow while
-            # preserving the intended relative relevance ordering. All valid
-            # comparable rows remain in the distribution.
-            weighted_rows: list[tuple[HistoricalRelationshipObservation, float]] = []
-            for observation, similarity, _coverage, _family_coverage in scored:
-                weight = exp(
-                    (similarity - max_similarity) / similarity_scale
-                )
-                weighted_rows.append((observation, weight))
+        scored: list[tuple[HistoricalRelationshipObservation, float]] = []
+        for observation in history:
+            matched = 0
+            observed_count = 0
+            compared_weight = 0.0
+            for feature in result.variables:
+                observed = observation.states.get(feature)
+                weight = feature_weights[feature]
+                if observed is None:
+                    continue
+                observed_count += 1
+                compared_weight += weight
+                if observed == current_states[feature]:
+                    matched += 1
+            state_coverage = compared_weight / total_weight * 100.0
+            family_coverage = observed_count / len(result.variables) * 100.0
+            if (
+                state_coverage >= self.min_state_coverage_pct
+                and family_coverage >= self.min_family_coverage_pct
+            ):
+                scored.append((observation, matched / len(result.variables)))
 
-            total_weight = sum(weight for _, weight in weighted_rows)
-            if total_weight <= 0.0:
-                continue
+        if len(scored) < self.min_observations:
+            return result
 
-            outcomes = [observation.stock_return_pct for observation, _ in weighted_rows]
-            weights = [weight for _, weight in weighted_rows]
-            weighted_mean = sum(
-                outcome * weight
-                for outcome, weight in zip(outcomes, weights)
-            ) / total_weight
-            weighted_median_value = weighted_median(outcomes, weights)
-            weighted_positive_rate = (
-                sum(
-                    weight
-                    for outcome, weight in zip(outcomes, weights)
-                    if outcome > 0.0
-                )
-                / total_weight
-            ) * 100.0
+        similarities = [similarity for _observation, similarity in scored]
+        positive_similarity = [value for value in similarities if value > 0.0]
+        similarity_scale = median(positive_similarity) if positive_similarity else 1.0
+        similarity_scale = max(similarity_scale, 1e-9)
+        max_similarity = max(similarities)
+        weights = [
+            exp((similarity - max_similarity) / similarity_scale)
+            for _observation, similarity in scored
+        ]
 
-            weight_square_sum = sum(weight * weight for weight in weights)
-            effective_sample_size = (
-                (total_weight * total_weight) / weight_square_sum
-                if weight_square_sum > 0.0
-                else 0.0
-            )
-            weight_concentration = max(weights) / total_weight
-
-            baseline_mean = (
-                sum(observation.stock_return_pct for observation in baseline)
-                / len(baseline)
-            )
-            baseline_dispersion = sqrt(
-                sum(
-                    (observation.stock_return_pct - baseline_mean) ** 2
-                    for observation in baseline
-                )
-                / max(len(baseline), 1)
-            )
-            weighted_lift = weighted_mean - baseline_mean
-            weighted_effect_strength = (
-                abs(weighted_lift) / baseline_dispersion
-                if baseline_dispersion > 0.0
-                else 0.0
-            )
-            weighted_reliability = min(
-                1.0,
-                sqrt(effective_sample_size / max(len(baseline), 1)),
-            )
-            weighted_score = weighted_effect_strength * weighted_reliability
-
-            exact_condition = _condition_key(current_states, feature_set)
-            exact_condition_count = (
-                sum(
-                    1
-                    for observation, _weight in weighted_rows
-                    if exact_condition is not None
-                    and _match_condition(observation, exact_condition)
-                )
-                if exact_condition is not None
-                else 0
-            )
-
-            stability = split_stability(
-                outcomes,
-                sem_multiplier=self.stability_sem_multiplier,
-            )
-            fit_dates = [item.as_of_date for item in history]
-            fit_start = min(fit_dates) if fit_dates else None
-            fit_end = max(fit_dates) if fit_dates else None
-            parameter_provenance = (
-                ("state_relevance_frequency", fit_start, fit_end),
-                ("method_b_similarity_scale", fit_start, fit_end),
-            )
-            mean_coverage = sum(item[2] for item in scored) / len(scored)
-            mean_family_coverage = sum(item[3] for item in scored) / len(scored)
-
-            results.append(
-                RelationshipResult(
-                    method="B",
-                    variables=feature_set,
-                    condition=exact_condition or (),
-                    sample_count=len(weighted_rows),
-                    mean_return_pct=weighted_mean,
-                    median_return_pct=weighted_median_value,
-                    baseline_mean_return_pct=baseline_mean,
-                    lift_pct=weighted_lift,
-                    positive_rate_pct=weighted_positive_rate,
-                    effect_strength=weighted_effect_strength,
-                    reliability=weighted_reliability,
-                    score=weighted_score,
-                    stable=stability.stable,
-                    weighted_mean_return_pct=weighted_mean,
-                    weighted_positive_rate_pct=weighted_positive_rate,
-                    effective_sample_size=effective_sample_size,
-                    weight_concentration=weight_concentration,
-                    supporting_observations=tuple(
-                        (item.as_of_date, float(item.stock_return_pct))
-                        for item, _weight in weighted_rows
-                    ),
-                    supporting_weights=tuple(
-                        float(weight) for _item, weight in weighted_rows
-                    ),
-                    state_coverage_pct=mean_coverage,
-                    family_coverage_pct=mean_family_coverage,
-                    stability_score=stability.stability_score,
-                    exact_condition_count=exact_condition_count,
-                    parameter_provenance=parameter_provenance,
-                )
-            )
-
-        return sorted(
-            results,
-            key=lambda result: abs(result.score),
-            reverse=True,
+        return replace(
+            result,
+            supporting_observations=tuple(
+                (observation.as_of_date, float(observation.stock_return_pct))
+                for observation, _weight in scored
+            ),
+            supporting_weights=tuple(float(weight) for weight in weights),
         )
-
-    # --------------------------------------------------------
-    # Combined discovery
-    # --------------------------------------------------------
 
     def discover(
         self,

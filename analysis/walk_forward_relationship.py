@@ -15,7 +15,9 @@ from .ranking import RelationshipRanking, rank_relationships
 from .relationship import (
     HistoricalRelationshipObservation,
     RelationshipDiscoveryEngine,
+    RelationshipResult,
 )
+from .relationship_graph import candidate_feature_sets
 
 
 @dataclass(frozen=True)
@@ -274,14 +276,13 @@ def validate_walk_forward_relationships(
             leakage_violations += 1
             continue
 
-        method_a = discovery_engine.method_a_similar_states(
-            current_states=test_observation.states,
-            history=training,
+        discovered_results, _candidate_counts = _discover_all_candidate_relationships(
+            test_observation.states,
+            training,
+            discovery_engine,
         )
-        method_b = discovery_engine.method_b_conditioned_distribution(
-            current_states=test_observation.states,
-            history=training,
-        )
+        method_a = [item for item in discovered_results if item.method == "A"]
+        method_b = [item for item in discovered_results if item.method == "B"]
 
         top_a = _top_ranking(method_a)
         top_b = _top_ranking(method_b)
@@ -331,6 +332,62 @@ def validate_walk_forward_relationships(
         skipped_no_relationship=skipped_no_relationship,
     )
 
+
+
+def _discover_all_candidate_relationships(
+    current_states: dict[str, str],
+    history: list[HistoricalRelationshipObservation],
+    engine: RelationshipDiscoveryEngine,
+) -> tuple[list[RelationshipResult], dict[int, int]]:
+    """Discover A/B evidence at every requested level using one structural graph.
+
+    Levels 1 and 2 are exhaustively enumerated from the canonical relationship
+    graph. Level 3+ is added through the adaptive higher-order engine, which
+    only expands evidence-supported parents and respects ``engine.max_order``.
+    """
+    if not current_states or not history:
+        return [], {}
+
+    discovered: dict[tuple[str, tuple[str, ...]], RelationshipResult] = {}
+    counts: dict[int, int] = {}
+
+    base_order = min(engine.max_order, 2)
+    for candidate in candidate_feature_sets(current_states.keys(), base_order):
+        subset = {feature: current_states[feature] for feature in candidate}
+        candidate_engine = RelationshipDiscoveryEngine(
+            max_order=len(candidate),
+            min_observations=engine.min_observations,
+            min_state_coverage_pct=engine.min_state_coverage_pct,
+            min_family_coverage_pct=engine.min_family_coverage_pct,
+            stability_sem_multiplier=engine.stability_sem_multiplier,
+        )
+        results = (
+            candidate_engine.method_a_similar_states(subset, history)
+            + candidate_engine.method_b_conditioned_distribution(subset, history)
+        )
+        for result in results:
+            if tuple(sorted(result.variables)) != tuple(sorted(candidate)):
+                continue
+            discovered[(result.method, tuple(sorted(result.variables)))] = result
+
+    if engine.max_order >= 3:
+        from .adaptive_combination import discover_adaptive_higher_order
+
+        adaptive = discover_adaptive_higher_order(
+            current_states=current_states,
+            history=history,
+            engine=engine,
+        )
+        for ranking in adaptive.rankings:
+            for result in ranking.method_results:
+                if len(result.variables) < 3:
+                    continue
+                discovered[(result.method, tuple(sorted(result.variables)))] = result
+
+    for _method, variables in discovered:
+        counts[len(variables)] = counts.get(len(variables), 0) + 1
+
+    return list(discovered.values()), counts
 
 
 def _method_results_for_candidate(
@@ -516,8 +573,13 @@ def validate_walk_forward_relationships_hardened(
             min_family_coverage_pct=engine.min_family_coverage_pct,
             stability_sem_multiplier=engine.stability_sem_multiplier,
         )
-        discovery_a = discovery_engine.method_a_similar_states(test_observation.states, discovery_history)
-        discovery_b = discovery_engine.method_b_conditioned_distribution(test_observation.states, discovery_history)
+        discovered_results, _candidate_counts = _discover_all_candidate_relationships(
+            test_observation.states,
+            discovery_history,
+            discovery_engine,
+        )
+        discovery_a = [item for item in discovered_results if item.method == "A"]
+        discovery_b = [item for item in discovered_results if item.method == "B"]
 
         required_a = (
             "state_relevance_frequency",

@@ -80,3 +80,20 @@ def test_future_flow_rows_are_excluded_at_cutoff():
     ]
     states = build_institutional_state_atoms(rows, date(2026, 2, 1), date(2026, 2, 1), _fake_builder)
     assert "institutional.FII_FPI.cash_net_value" in states
+
+
+def test_unknown_trade_event_type_is_not_classified_as_sell():
+    from analysis.flow_state import _aggregate_trade_events
+
+    rows = [
+        {
+            "report_date": date(2026, 2, 1),
+            "transaction_type": "UNKNOWN",
+            "quantity": 100,
+            "trade_price": 100,
+        },
+    ]
+    aggregated = _aggregate_trade_events(rows)
+    assert aggregated[0]["buy_volume"] == 0.0
+    assert aggregated[0]["sell_volume"] == 0.0
+    assert aggregated[0]["gross_event_volume"] == 0.0

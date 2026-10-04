@@ -368,8 +368,12 @@ def _aggregate_trade_events(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             bucket["gross_event_volume"] += abs(quantity)
             if transaction_type == "BUY":
                 bucket["buy_volume"] += abs(quantity)
-            else:
+            elif transaction_type == "SELL":
                 bucket["sell_volume"] += abs(quantity)
+            else:
+                # Unknown transaction types are neither buy nor sell.
+                # Do not silently convert malformed/novel values into sells.
+                bucket["gross_event_volume"] -= abs(quantity)
         if price is not None:
             bucket["trade_price_sum"] += price
             bucket["trade_price_count"] += 1.0

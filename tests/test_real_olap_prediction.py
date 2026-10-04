@@ -18,7 +18,10 @@ def main() -> None:
         hardened_validation=True,
         performance_cache=True,
         progress_logging=True,
-        progress_every=10,
+        progress_every=5,
+        adaptive_relationship_search=False,
+        relationship_progress_every_candidates=1000,
+        relationship_candidate_batch_size=512,
     )
 
     result = validate_real_olap_predictions(config)

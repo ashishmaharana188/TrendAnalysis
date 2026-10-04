@@ -7,6 +7,7 @@ from typing import Iterable
 
 from .combination import _select_seed_pairs, _candidate_triples
 from .ranking import RelationshipRanking, rank_relationships
+from .relationship_graph import structurally_connected
 from .relationship import (
     HistoricalRelationshipObservation,
     RelationshipDiscoveryEngine,
@@ -146,28 +147,7 @@ def _candidate_children(
             if len(families) != len(candidate):
                 continue
 
-            # A child must keep the structural family graph connected.
-            visited = {next(iter(families))}
-            changed = True
-            while changed:
-                changed = False
-                for left in tuple(visited):
-                    for right in tuple(families - visited):
-                        if frozenset({left, right}) in {
-                            frozenset({"company.financials", "company.market"}),
-                            frozenset({"company.financials", "industry.market"}),
-                            frozenset({"industry.financials", "industry.market"}),
-                            frozenset({"industry.market", "sector.market"}),
-                            frozenset({"industry.market", "macro"}),
-                            frozenset({"industry.market", "global"}),
-                            frozenset({"sector.market", "benchmark"}),
-                            frozenset({"sector.market", "macro"}),
-                            frozenset({"sector.market", "global"}),
-                        }:
-                            visited.add(right)
-                            changed = True
-
-            if visited == families:
+            if structurally_connected(candidate):
                 result.add(candidate)
 
     return sorted(result)
@@ -339,6 +319,15 @@ def discover_adaptive_higher_order(
     steps: list[ExpansionStep] = []
     highest_order = 2 if seed_pairs else 1
 
+    if engine.max_order < 3:
+        return AdaptiveCombinationResult(
+            rankings=tuple(pair_rankings),
+            selected_relationships=tuple(pair_rankings),
+            steps=(),
+            highest_order=highest_order,
+            stopped_reason="max_order_reached",
+        )
+
     # Phase 4.6 triple generation is retained as the first expansion level.
     triple_candidates = _candidate_triples(current_states, seed_pairs)
     if not triple_candidates:
@@ -428,6 +417,8 @@ def discover_adaptive_higher_order(
     # naturally bounds the possible order.
     while current_parents:
         next_order = len(current_parents[0].variables) + 1
+        if next_order > engine.max_order:
+            break
         candidates = _candidate_children(current_states, current_parents)
         if not candidates:
             steps.append(

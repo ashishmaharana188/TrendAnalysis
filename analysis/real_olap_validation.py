@@ -101,6 +101,9 @@ class RealOLAPValidationConfig:
     performance_cache: bool = True
     progress_logging: bool = True
     progress_every: int = 10
+    adaptive_relationship_search: bool = False
+    relationship_progress_every_candidates: int = 1000
+    relationship_candidate_batch_size: int = 512
 
 
 @dataclass(frozen=True)
