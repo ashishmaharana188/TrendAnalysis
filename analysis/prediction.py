@@ -5,7 +5,19 @@ from datetime import date, datetime
 from math import sqrt
 from typing import Any, Iterable, Literal
 
-from .outcome_labels import OutcomeClass, OutcomeThresholds, classify_return, learn_outcome_thresholds
+from .method_a_prediction import build_method_a_probability
+from .method_b_prediction import build_method_b_probability
+from .outcome_labels import (
+    OutcomeClass,
+    OutcomeThresholds,
+    classify_return,
+    filter_completed_outcomes,
+    learn_outcome_thresholds,
+)
+from .decision import DecisionResult, decide_baseline_relative
+from .conviction import ConvictionResult, assess_conviction
+from .method_combination import CombinationMethodInput, CombinationResult, combine_method_probabilities
+from .prediction_hardening import PredictionProvenanceAudit, ValidationEvidenceAudit, audit_prediction_provenance
 from .ranking import RelationshipRanking, rank_relationships
 from .relationship import HistoricalRelationshipObservation, RelationshipDiscoveryEngine
 
@@ -90,37 +102,13 @@ def _top_direction(probabilities: dict[OutcomeClass, float]) -> OutcomeClass | N
     return ordered[0][0]
 
 
-def _standard_error_pct(probability_pct: float, effective_n: float) -> float:
-    if effective_n <= 0:
-        return 100.0
-    p = max(0.0, min(1.0, probability_pct / 100.0))
-    return sqrt(max(p * (1.0 - p), 0.0) / effective_n) * 100.0
-
-
 def _directional_signal(
     probabilities: dict[OutcomeClass, float],
     baseline: dict[OutcomeClass, float],
     effective_n: float,
 ) -> PredictionTrend:
-    """Choose a direction only when a directional class beats its own baseline."""
-    candidates = ["UP", "DOWN"]
-    lifts = {label: probabilities[label] - baseline[label] for label in candidates}
-    viable = [label for label in candidates if lifts[label] > 0.0]
-    if not viable:
-        top = _top_direction(probabilities)
-        return "SIDEWAYS" if top == "SIDEWAYS" else "NO_CLEAR_TREND"
-
-    best = max(viable, key=lambda label: probabilities[label])
-    second = max(
-        (probabilities[label] for label in ("SIDEWAYS", "UP", "DOWN") if label != best),
-        default=0.0,
-    )
-
-    margin = probabilities[best] - second
-    uncertainty = _standard_error_pct(probabilities[best], effective_n)
-    if margin <= uncertainty:
-        return "NO_CLEAR_TREND"
-    return best  # type: ignore[return-value]
+    """Backward-compatible adapter around the explicit Phase 5.4 decision layer."""
+    return decide_baseline_relative(probabilities, baseline, effective_n).trend
 
 
 @dataclass(frozen=True)
@@ -141,6 +129,9 @@ class MethodPrediction:
     condition: tuple[str, ...]
     limited: bool = False
     limitations: tuple[str, ...] = ()
+    decision: DecisionResult | None = None
+    combination: CombinationResult | None = None
+    conviction_result: ConvictionResult | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -160,6 +151,7 @@ class MethodPrediction:
             "condition": list(self.condition),
             "limited": self.limited,
             "limitations": list(self.limitations),
+            "decision": self.decision.as_dict() if self.decision else None,
         }
 
 
@@ -184,6 +176,10 @@ class PredictionResult:
     limited: bool
     limitations: tuple[str, ...] = ()
     validated_evidence: bool = False
+    decision: DecisionResult | None = None
+    combination: CombinationResult | None = None
+    conviction_result: ConvictionResult | None = None
+    provenance_audit: PredictionProvenanceAudit | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -206,6 +202,10 @@ class PredictionResult:
             "limited": self.limited,
             "limitations": list(self.limitations),
             "validated_evidence": self.validated_evidence,
+            "decision": self.decision.as_dict() if self.decision else None,
+            "combination": self.combination.as_dict() if self.combination else None,
+            "conviction_result": self.conviction_result.as_dict() if self.conviction_result else None,
+            "provenance_audit": self.provenance_audit.as_dict() if self.provenance_audit else None,
             "probability_basis": "empirical_conditional_class_share_uncalibrated",
         }
 
@@ -250,6 +250,84 @@ class PredictionEngine:
         ]
         return sorted(history, key=lambda item: _as_date(item.as_of_date))
 
+    def _method_a_prediction(
+        self,
+        ranking: RelationshipRanking | None,
+        thresholds: OutcomeThresholds,
+        baseline_probabilities: dict[OutcomeClass, float],
+    ) -> MethodPrediction | None:
+        if ranking is None:
+            return None
+
+        best = max(
+            ranking.method_results,
+            key=lambda item: abs(item.score),
+            default=None,
+        )
+        probability = build_method_a_probability(best, thresholds)
+
+        # Phase 5.2 constructs the empirical distribution. The directional
+        # decision below is retained here only as an adapter to the existing
+        # MethodPrediction surface; baseline-relative direction is formally
+        # treated as Phase 5.4.
+        if probability.limited:
+            return MethodPrediction(
+                method="A",
+                trend="NO_CLEAR_TREND",
+                probabilities_pct=probability.probabilities_pct,
+                baseline_probabilities_pct=baseline_probabilities,
+                expected_return_pct=probability.expected_return_pct,
+                baseline_return_pct=probability.baseline_return_pct,
+                return_lift_pct=probability.return_lift_pct,
+                evidence_score=probability.evidence_score,
+                reliability=probability.reliability,
+                sample_count=probability.sample_count,
+                effective_sample_size=probability.effective_sample_size,
+                stable=probability.stable,
+                variables=probability.variables,
+                condition=probability.condition,
+                limited=True,
+                limitations=probability.limitations,
+                decision=DecisionResult(
+                    trend="NO_CLEAR_TREND",
+                    selected_class=None,
+                    probability_pct=0.0,
+                    baseline_probability_pct=0.0,
+                    lift_pct=0.0,
+                    margin_pct=0.0,
+                    uncertainty_pct=100.0,
+                    effective_sample_size=0.0,
+                    reason="Method A probability distribution is limited.",
+                    limited=True,
+                ),
+            )
+
+        decision = decide_baseline_relative(
+            probability.probabilities_pct,
+            baseline_probabilities,
+            probability.effective_sample_size,
+        )
+        trend = decision.trend
+        return MethodPrediction(
+            method="A",
+            trend=trend,
+            probabilities_pct=probability.probabilities_pct,
+            baseline_probabilities_pct=baseline_probabilities,
+            expected_return_pct=probability.expected_return_pct,
+            baseline_return_pct=probability.baseline_return_pct,
+            return_lift_pct=probability.return_lift_pct,
+            evidence_score=probability.evidence_score,
+            reliability=probability.reliability,
+            sample_count=probability.sample_count,
+            effective_sample_size=probability.effective_sample_size,
+            stable=probability.stable,
+            variables=probability.variables,
+            condition=probability.condition,
+            limited=False,
+            limitations=probability.limitations,
+            decision=decision,
+        )
+
     def _method_prediction(
         self,
         ranking: RelationshipRanking | None,
@@ -260,59 +338,119 @@ class PredictionEngine:
         if ranking is None:
             return None
 
-        probabilities, support_weight = _support_distribution(
-            ranking,
-            thresholds,
+        best = max(
+            ranking.method_results,
+            key=lambda item: abs(item.score),
+            default=None,
         )
-        best = max(ranking.method_results, key=lambda item: abs(item.score), default=None)
-        if best is None or support_weight <= 0 or thresholds.limited:
+        probability = build_method_b_probability(best, thresholds)
+
+        # Phase 5.3 constructs the coherent Method B weighted empirical
+        # distribution. Direction selection remains a later Phase 5 stage.
+        if probability.limited:
             return MethodPrediction(
-                method=best.method if best else "UNKNOWN",
+                method="B",
                 trend="NO_CLEAR_TREND",
-                probabilities_pct=probabilities,
+                probabilities_pct=probability.probabilities_pct,
                 baseline_probabilities_pct=baseline_probabilities,
-                expected_return_pct=best.mean_return_pct if best else 0.0,
-                baseline_return_pct=best.baseline_mean_return_pct if best else 0.0,
-                return_lift_pct=best.lift_pct if best else 0.0,
-                evidence_score=best.score if best else 0.0,
-                reliability=best.reliability if best else 0.0,
-                sample_count=best.sample_count if best else 0,
-                effective_sample_size=best.effective_sample_size or support_weight if best else support_weight,
-                stable=best.stable if best else False,
-                variables=best.variables if best else (),
-                condition=best.condition if best else (),
+                expected_return_pct=probability.expected_return_pct,
+                baseline_return_pct=probability.baseline_return_pct,
+                return_lift_pct=probability.return_lift_pct,
+                evidence_score=probability.evidence_score,
+                reliability=probability.reliability,
+                sample_count=probability.sample_count,
+                effective_sample_size=probability.effective_sample_size,
+                stable=probability.stable,
+                variables=probability.variables,
+                condition=probability.condition,
                 limited=True,
-                limitations=("Prediction evidence could not be converted into three-class probabilities.",),
+                limitations=probability.limitations,
+                decision=DecisionResult(
+                    trend="NO_CLEAR_TREND",
+                    selected_class=None,
+                    probability_pct=0.0,
+                    baseline_probability_pct=0.0,
+                    lift_pct=0.0,
+                    margin_pct=0.0,
+                    uncertainty_pct=100.0,
+                    effective_sample_size=0.0,
+                    reason="Method B probability distribution is limited.",
+                    limited=True,
+                ),
             )
 
-        effective_n = best.effective_sample_size or support_weight
-        trend = _directional_signal(
-            probabilities,
+        effective_n = probability.effective_sample_size
+        decision = decide_baseline_relative(
+            probability.probabilities_pct,
             baseline_probabilities,
             effective_n,
         )
+        trend = decision.trend
         return MethodPrediction(
-            method=best.method,
+            method="B",
             trend=trend,
-            probabilities_pct=probabilities,
+            probabilities_pct=probability.probabilities_pct,
             baseline_probabilities_pct=baseline_probabilities,
-            expected_return_pct=best.mean_return_pct,
-            baseline_return_pct=best.baseline_mean_return_pct,
-            return_lift_pct=best.lift_pct,
-            evidence_score=best.score,
-            reliability=best.reliability,
-            sample_count=best.sample_count,
+            expected_return_pct=probability.expected_return_pct,
+            baseline_return_pct=probability.baseline_return_pct,
+            return_lift_pct=probability.return_lift_pct,
+            evidence_score=probability.evidence_score,
+            reliability=probability.reliability,
+            sample_count=probability.sample_count,
             effective_sample_size=effective_n,
-            stable=best.stable,
-            variables=best.variables,
-            condition=best.condition,
+            stable=probability.stable,
+            variables=probability.variables,
+            condition=probability.condition,
+            decision=decision,
         )
 
     @staticmethod
     def _method_weight(method: MethodPrediction) -> float:
-        """Evidence-adaptive weight, recomputed for each prediction."""
-        sample_term = sqrt(max(method.effective_sample_size, 1.0))
-        return max(method.evidence_score, 0.0) * max(method.reliability, 0.0) * sample_term
+        """Backward-compatible adapter for the Phase 5.5 weighting rule."""
+        return next(
+            iter(
+                combine_method_probabilities(
+                    [
+                        CombinationMethodInput(
+                            method=method.method,
+                            probabilities_pct=method.probabilities_pct,
+                            expected_return_pct=method.expected_return_pct,
+                            evidence_score=method.evidence_score,
+                            reliability=method.reliability,
+                            effective_sample_size=method.effective_sample_size,
+                            stable=method.stable,
+                            trend=method.trend,
+                            limited=method.limited,
+                        )
+                    ]
+                ).method_weights.values()
+            ),
+            0.0,
+        )
+
+    @staticmethod
+    def _combination_inputs(
+        method_a: MethodPrediction | None,
+        method_b: MethodPrediction | None,
+    ) -> list[CombinationMethodInput]:
+        inputs: list[CombinationMethodInput] = []
+        for method in (method_a, method_b):
+            if method is None:
+                continue
+            inputs.append(
+                CombinationMethodInput(
+                    method=method.method,
+                    probabilities_pct=method.probabilities_pct,
+                    expected_return_pct=method.expected_return_pct,
+                    evidence_score=method.evidence_score,
+                    reliability=method.reliability,
+                    effective_sample_size=method.effective_sample_size,
+                    stable=method.stable,
+                    trend=method.trend,
+                    limited=method.limited,
+                )
+            )
+        return inputs
 
     def _combine(
         self,
@@ -322,49 +460,29 @@ class PredictionEngine:
         *,
         validated_evidence: bool = False,
     ) -> tuple[PredictionTrend, Conviction, dict[OutcomeClass, float], float | None, bool]:
-        methods = [method for method in (method_a, method_b) if method is not None and not method.limited]
-        if not methods:
+        """Backward-compatible wrapper around the explicit Phase 5.5 layer."""
+        combination = combine_method_probabilities(
+            self._combination_inputs(method_a, method_b)
+        )
+        if combination.limited:
             return "NO_CLEAR_TREND", "NONE", dict(baseline), None, False
 
-        weights = [self._method_weight(method) for method in methods]
-        total = sum(weights)
-        if total <= 0:
-            return "NO_CLEAR_TREND", "NONE", dict(baseline), None, False
-
-        combined = _empty_probabilities()
-        expected_return = 0.0
-        for method, weight in zip(methods, weights):
-            share = weight / total
-            for label in combined:
-                combined[label] += method.probabilities_pct[label] * share
-            expected_return += method.expected_return_pct * share
-        combined = _normalize_probabilities(combined)
-
-        directional = [method.trend for method in methods if method.trend in {"UP", "DOWN"}]
-        agreement = len(directional) == 2 and directional[0] == directional[1]
-        conflict = len(directional) == 2 and directional[0] != directional[1]
-
-        trend = _directional_signal(combined, baseline, max(sum(method.effective_sample_size for method in methods), 1.0))
-        if conflict:
+        combined_decision = decide_baseline_relative(
+            combination.probabilities_pct,
+            baseline,
+            max(combination.effective_sample_size_sum, 1.0),
+        )
+        trend = combined_decision.trend
+        if combination.method_conflict:
             trend = "NO_CLEAR_TREND"
 
-        if agreement and trend in {"UP", "DOWN"}:
-            # STRONG is reserved for evidence that has survived an explicit
-            # out-of-sample validation gate. Method agreement + stability alone
-            # is still in-sample evidence and can only produce MODERATE.
-            conviction: Conviction = (
-                "STRONG"
-                if validated_evidence and all(method.stable for method in methods)
-                else "MODERATE"
-            )
-        elif len(directional) == 1 and trend == directional[0]:
-            conviction = "MODERATE"
-        elif trend == "SIDEWAYS":
-            conviction = "LOW"
-        else:
-            conviction = "NONE" if conflict else "LOW"
-
-        return trend, conviction, combined, expected_return, agreement
+        conviction_result = assess_conviction(
+            trend=trend,
+            combination=combination,
+            decision=combined_decision,
+            validated_evidence=validated_evidence,
+        )
+        return trend, conviction_result.conviction, combination.probabilities_pct, combination.expected_return_pct, combination.method_agreement
 
     def predict(
         self,
@@ -377,6 +495,7 @@ class PredictionEngine:
         benchmark: str | None = None,
         entry_mode: str | None = None,
         validated_evidence: bool = False,
+        validation_evidence: ValidationEvidenceAudit | None = None,
     ) -> PredictionResult:
         """
         Build a pre-calibration prediction from training observations only.
@@ -385,14 +504,12 @@ class PredictionEngine:
         cross-company robustness and trading-performance validation remain Phase 6.
         """
         cutoff = _as_date(prediction_date)
-        source_observations = [
-            observation
-            for observation in observations
-            if observation.target == target
-            and _as_date(observation.as_of_date) < cutoff
-            and observation.stock_return_pct is not None
-        ]
-        history = self._training_history(source_observations, target, cutoff)
+        source_observations = list(observations)
+        history, training_filter = filter_completed_outcomes(
+            observations=source_observations,
+            target=target,
+            cutoff_date=cutoff,
+        )
 
         thresholds = learn_outcome_thresholds(
             [item.stock_return_pct for item in history],
@@ -401,11 +518,9 @@ class PredictionEngine:
         baseline = _baseline_probabilities(history, thresholds)
 
         limitations: list[str] = []
-        excluded_incomplete = len(source_observations) - len(history)
-        if excluded_incomplete > 0:
+        if training_filter.excluded_count > 0:
             limitations.append(
-                f"Excluded {excluded_incomplete} historical rows whose forward outcome "
-                "was not fully realized before the prediction cutoff."
+                f"Excluded {training_filter.excluded_count} source rows from the cutoff-safe training universe."
             )
         if thresholds.limited:
             limitations.append(thresholds.limitation or "Outcome thresholds are limited.")
@@ -419,9 +534,59 @@ class PredictionEngine:
         ranked_a = rank_relationships(discovered.get("method_a", []))
         ranked_b = rank_relationships(discovered.get("method_b", []))
 
-        method_a = self._method_prediction(
+        provenance_audit = audit_prediction_provenance(
+            observations=source_observations,
+            target=target,
+            cutoff_date=cutoff,
+            training_history=history,
+            thresholds=thresholds,
+            ranked_a=ranked_a,
+            ranked_b=ranked_b,
+            validated_evidence=validated_evidence,
+            validation_evidence=validation_evidence,
+        )
+        if not provenance_audit.clean:
+            limitations.extend(provenance_audit.limitations)
+            limited_decision = DecisionResult(
+                trend="NO_CLEAR_TREND",
+                selected_class=None,
+                probability_pct=0.0,
+                baseline_probability_pct=0.0,
+                lift_pct=0.0,
+                margin_pct=0.0,
+                uncertainty_pct=100.0,
+                effective_sample_size=0.0,
+                reason="Phase 5 provenance hardening failed; prediction is suppressed.",
+                limited=True,
+            )
+            return PredictionResult(
+                target=target,
+                prediction_date=cutoff,
+                analysis_timeframe=analysis_timeframe,
+                holding_period_months=holding_period_months,
+                benchmark=benchmark,
+                entry_mode=entry_mode,
+                training_observations=len(history),
+                outcome_thresholds=thresholds,
+                baseline_probabilities_pct=baseline,
+                method_a=None,
+                method_b=None,
+                trend="NO_CLEAR_TREND",
+                conviction="NONE",
+                probabilities_pct=dict(baseline),
+                expected_return_pct=None,
+                method_agreement=False,
+                limited=True,
+                limitations=tuple(dict.fromkeys(limitations)),
+                validated_evidence=False,
+                decision=limited_decision,
+                combination=None,
+                conviction_result=None,
+                provenance_audit=provenance_audit,
+            )
+
+        method_a = self._method_a_prediction(
             ranked_a[0] if ranked_a else None,
-            history,
             thresholds,
             baseline,
         )
@@ -437,12 +602,47 @@ class PredictionEngine:
         if method_b is None:
             limitations.append("Method B produced no usable relationship for the current state.")
 
-        trend, conviction, probabilities, expected_return, agreement = self._combine(
-            method_a,
-            method_b,
-            baseline,
+        combination = combine_method_probabilities(
+            self._combination_inputs(method_a, method_b)
+        )
+        if combination.limited:
+            trend = "NO_CLEAR_TREND"
+            probabilities, expected_return, agreement = dict(baseline), None, False
+            combined_decision = decide_baseline_relative(
+                probabilities, baseline, 0.0
+            )
+        else:
+            combined_decision = decide_baseline_relative(
+                combination.probabilities_pct,
+                baseline,
+                max(combination.effective_sample_size_sum, 1.0),
+            )
+            trend = combined_decision.trend
+            if combination.method_conflict:
+                trend = "NO_CLEAR_TREND"
+                combined_decision = DecisionResult(
+                    trend="NO_CLEAR_TREND",
+                    selected_class=combined_decision.selected_class,
+                    probability_pct=combined_decision.probability_pct,
+                    baseline_probability_pct=combined_decision.baseline_probability_pct,
+                    lift_pct=combined_decision.lift_pct,
+                    margin_pct=combined_decision.margin_pct,
+                    uncertainty_pct=combined_decision.uncertainty_pct,
+                    effective_sample_size=combined_decision.effective_sample_size,
+                    reason="Method A and Method B give conflicting directional signals.",
+                    limited=combined_decision.limited,
+                )
+            probabilities = combination.probabilities_pct
+            expected_return = combination.expected_return_pct
+            agreement = combination.method_agreement
+
+        conviction_result = assess_conviction(
+            trend=trend,
+            combination=combination,
+            decision=combined_decision,
             validated_evidence=validated_evidence,
         )
+        conviction = conviction_result.conviction
 
         # An absent relationship is an evidence limitation, not automatically
         # a data-quality limitation. Overall LIMITED is reserved for an
@@ -451,6 +651,11 @@ class PredictionEngine:
         limited = thresholds.limited or bool(
             (method_a and method_a.limited) or (method_b and method_b.limited)
         )
+
+        trend = combined_decision.trend
+        if combination.method_conflict:
+            trend = "NO_CLEAR_TREND"
+            conviction = "NONE"
 
         return PredictionResult(
             target=target,
@@ -472,4 +677,8 @@ class PredictionEngine:
             limited=limited,
             limitations=tuple(limitations),
             validated_evidence=validated_evidence,
+            decision=combined_decision,
+            combination=combination,
+            conviction_result=conviction_result,
+            provenance_audit=provenance_audit,
         )
