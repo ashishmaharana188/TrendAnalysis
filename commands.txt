@@ -1,0 +1,21 @@
+source .venv/Scripts/activate
+py -m streamlit run dashboard.py
+
+duckdb -ui
+
+python -m scripts.statementScrape
+pip install -r requirements.txt
+
+// run parsers
+python scripts/bhavcopyParser.py bulk
+python scripts/derivativesParser.py
+
+
+"USD_INR"
+"US_Dollar_Index"
+"Broad_Commodity"
+"Brent_Crude"
+"US_10Y_Yield"
+"Yield_Spread"
+"India_10Y_Yield"
+"India_CPI"

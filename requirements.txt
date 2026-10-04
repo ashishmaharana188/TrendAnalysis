@@ -1,0 +1,12 @@
+pandas
+duckdb
+polaris
+numpy
+yfinance
+requests
+urllib3
+beautifulsoup4
+python-dotenv
+streamlit
+plotly
+#sentence-transformers
