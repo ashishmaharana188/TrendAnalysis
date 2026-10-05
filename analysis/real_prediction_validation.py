@@ -9,6 +9,8 @@ import time
 
 from .outcome_labels import OutcomeClass, classify_return
 from .prediction import PredictionEngine, PredictionResult
+from .ranking import rank_relationships
+from .walk_forward_relationship import validate_walk_forward_relationships_hardened
 from .relationship import HistoricalRelationshipObservation
 
 try:
@@ -120,6 +122,9 @@ class Phase5RealOLAPValidationResult:
     latest_validated_prediction: dict[str, Any] | None
     latest_market_date: date | None
     phase4_surface_audit: dict[str, Any] | None
+    selection_candidate_evaluations: int = 0
+    selection_validated_predictions: int = 0
+    multiple_testing_controlled_folds: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -145,6 +150,9 @@ class Phase5RealOLAPValidationResult:
             "latest_validated_prediction": self.latest_validated_prediction,
             "latest_market_date": self.latest_market_date,
             "phase4_surface_audit": self.phase4_surface_audit,
+            "selection_candidate_evaluations": self.selection_candidate_evaluations,
+            "selection_validated_predictions": self.selection_validated_predictions,
+            "multiple_testing_controlled_folds": self.multiple_testing_controlled_folds,
         }
 
 
@@ -287,6 +295,140 @@ def validate_real_olap_predictions(
     candidate_predictions = len(observations)
 
     _configure_phase5_progress(getattr(config, "progress_logging", True))
+
+    # Hardened Phase 5.8 must not select the strongest relationship directly
+    # from the same history used to estimate its apparent effect. Reuse the
+    # Phase 4.10 nested discovery -> inner-selection -> FDR gate, then build
+    # the Phase 5 probabilities from only the relationships that survived it.
+    if prediction_engine is None and bool(getattr(config, "hardened_validation", True)):
+        _phase5_progress(
+            getattr(config, "progress_logging", True),
+            "Nested selection start | exhaustive=%s | selection_fraction=%.2f | alpha=%.2f",
+            not bool(getattr(config, "adaptive_relationship_search", False)),
+            float(getattr(config, "selection_fraction", 0.30)),
+            float(getattr(config, "multiple_testing_alpha", 0.10)),
+        )
+        from .relationship import RelationshipDiscoveryEngine
+        selector_engine = RelationshipDiscoveryEngine(
+            max_order=3,
+            min_observations=config.min_training_observations,
+            adaptive_higher_order=bool(getattr(config, "adaptive_relationship_search", False)),
+            progress_callback=lambda message: _phase5_progress(getattr(config, "progress_logging", True), message),
+            progress_every_candidates=int(getattr(config, "relationship_progress_every_candidates", 1000)),
+            candidate_batch_size=int(getattr(config, "relationship_candidate_batch_size", 512)),
+            retain_supporting_data=True,
+        )
+        nested = validate_walk_forward_relationships_hardened(
+            observations,
+            selector_engine,
+            min_training_observations=config.min_training_observations,
+            selection_fraction=float(getattr(config, "selection_fraction", 0.30)),
+            multiple_testing_alpha=float(getattr(config, "multiple_testing_alpha", 0.10)),
+            purge_overlapping_labels=True,
+        )
+        prediction_engine = PredictionEngine(
+            relationship_engine=selector_engine,
+            min_threshold_observations=config.min_training_observations,
+        )
+        folds: list[PredictionFoldResult] = []
+        skipped_threshold_limited = 0
+        skipped_provenance_failed = 0
+        skipped_invalid_actual = 0
+        conviction_counts = {key: 0 for key in ("STRONG", "MODERATE", "LOW", "NONE")}
+
+        nested_by_date = {fold.prediction_date: fold for fold in nested.folds}
+        for fold_index, observation in enumerate(observations, start=1):
+            cutoff = _as_date(observation.as_of_date)
+            if fold_index == 1 or fold_index % max(1, getattr(config, "progress_every", 10)) == 0 or fold_index == candidate_predictions:
+                _phase5_progress(
+                    getattr(config, "progress_logging", True),
+                    "Nested fold %d/%d | prediction_date=%s",
+                    fold_index, candidate_predictions, cutoff,
+                )
+            selected_fold = nested_by_date.get(cutoff)
+            if selected_fold is None:
+                continue
+            selected_a = getattr(selected_fold, "selected_a_result", None)
+            selected_b = getattr(selected_fold, "selected_b_result", None)
+            ranking_a = rank_relationships([selected_a])[0] if selected_a is not None else None
+            ranking_b = rank_relationships([selected_b])[0] if selected_b is not None else None
+            result = prediction_engine.predict(
+                target=observation.target,
+                current_states=dict(observation.states),
+                observations=observations,
+                prediction_date=cutoff,
+                analysis_timeframe=config.analysis_timeframe,
+                holding_period_months=config.holding_period_months,
+                benchmark=config.benchmark,
+                entry_mode=config.entry_mode,
+                validated_evidence=False,
+                validation_evidence=None,
+                selected_relationships={"A": ranking_a, "B": ranking_b},
+            )
+            thresholds = result.outcome_thresholds
+            if thresholds.limited:
+                skipped_threshold_limited += 1
+                continue
+            audit = result.provenance_audit
+            provenance_clean = bool(audit and audit.clean)
+            if not provenance_clean:
+                skipped_provenance_failed += 1
+            actual_numeric = observation.stock_return_pct
+            if actual_numeric is None:
+                skipped_invalid_actual += 1
+                continue
+            actual_numeric = float(actual_numeric)
+            actual_class = classify_return(actual_numeric, thresholds)
+            hit = _directional_hit(result.trend, actual_class)
+            conviction_counts[result.conviction] = conviction_counts.get(result.conviction, 0) + 1
+            folds.append(
+                PredictionFoldResult(
+                    prediction_date=cutoff,
+                    actual_return_pct=actual_numeric,
+                    actual_class=actual_class,
+                    predicted_trend=result.trend,
+                    conviction=result.conviction,
+                    probabilities_pct=dict(result.probabilities_pct),
+                    baseline_probabilities_pct=dict(result.baseline_probabilities_pct),
+                    expected_return_pct=result.expected_return_pct,
+                    training_observations=result.training_observations,
+                    method_a_trend=result.method_a.trend if result.method_a else None,
+                    method_b_trend=result.method_b.trend if result.method_b else None,
+                    method_agreement=result.method_agreement,
+                    limited=result.limited,
+                    provenance_clean=provenance_clean,
+                    hit=hit,
+                )
+            )
+
+        method_a = _summary("A", folds, lambda fold: fold.method_a_trend)
+        method_b = _summary("B", folds, lambda fold: fold.method_b_trend)
+        combined = _summary("COMBINED", folds, lambda fold: fold.predicted_trend)
+        latest_fold = folds[-1] if folds else None
+        result = Phase5RealOLAPValidationResult(
+            ticker=config.ticker, benchmark=config.benchmark,
+            analysis_timeframe=config.analysis_timeframe,
+            holding_period_months=config.holding_period_months,
+            entry_mode=config.entry_mode,
+            candidate_predictions=candidate_predictions,
+            evaluated_predictions=len(folds),
+            skipped_threshold_limited=skipped_threshold_limited,
+            skipped_provenance_failed=skipped_provenance_failed,
+            skipped_invalid_actual=skipped_invalid_actual,
+            prediction_folds=tuple(folds), method_a=method_a, method_b=method_b, combined=combined,
+            baseline_majority_accuracy_pct=_majority_baseline_accuracy(folds),
+            mean_combined_probabilities_pct=_mean_probabilities(folds),
+            mean_combined_expected_return_pct=_mean_expected_return(folds),
+            conviction_counts=conviction_counts,
+            latest_validated_prediction_date=latest_fold.prediction_date if latest_fold else None,
+            latest_validated_prediction=latest_fold.as_dict() if latest_fold else None,
+            latest_market_date=latest_market_date,
+            phase4_surface_audit=panel_stats.get("state_surface_audit"),
+            selection_candidate_evaluations=nested.selection_candidate_evaluations,
+            selection_validated_predictions=nested.selection_validated_predictions,
+            multiple_testing_controlled_folds=nested.multiple_testing_controlled_folds,
+        )
+        return result
     if prediction_engine is None:
         progress_every_candidates = max(1, int(getattr(config, "relationship_progress_every_candidates", 500)))
 
@@ -462,6 +604,9 @@ def print_real_olap_prediction_report(result: Phase5RealOLAPValidationResult) ->
     print("Mean combined probabilities:", {k: round(v, 2) for k, v in result.mean_combined_probabilities_pct.items()})
     print("Mean combined expected return:", None if result.mean_combined_expected_return_pct is None else round(result.mean_combined_expected_return_pct, 4))
     print("Conviction counts:", result.conviction_counts)
+    print("Selection candidate evaluations:", result.selection_candidate_evaluations)
+    print("Selection-validated predictions:", result.selection_validated_predictions)
+    print("Multiple-testing-controlled folds:", result.multiple_testing_controlled_folds)
     print("Latest validated prediction date:", result.latest_validated_prediction_date)
     print("Latest market date:", result.latest_market_date)
     print("NOTE: Phase 5.8 is diagnostic. Probability calibration and full OOS performance remain Phase 6.")

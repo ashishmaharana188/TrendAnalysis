@@ -121,6 +121,43 @@ def test_hardened_walk_forward_purges_overlapping_labels() -> None:
     assert result.unknown_overlap_observations == 0
 
 
+
+def test_vectorized_search_permutation_matches_scalar_max_stat() -> None:
+    from analysis.hardening_4_10 import search_adjusted_permutation_p_values
+
+    base = date(2021, 1, 1)
+    universe = [
+        (base + timedelta(days=index), float((index % 7) - 3))
+        for index in range(30)
+    ]
+    candidate_weights = []
+    for offset in range(10):
+        candidate_weights.append([
+            1.0 if index % 5 == offset % 5 else 0.0
+            for index in range(30)
+        ])
+
+    scalar = search_adjusted_permutation_p_values(
+        [(universe, weights) for weights in candidate_weights],
+        0.0,
+        family_id="vector-test",
+        universe_observations=universe,
+        permutations=29,
+        seed=17,
+        compute_raw_p_values=True,
+    )
+    vectorized = search_adjusted_permutation_p_values(
+        [(universe, weights) for weights in candidate_weights],
+        0.0,
+        family_id="vector-test",
+        universe_observations=universe,
+        permutations=29,
+        seed=17,
+        compute_raw_p_values=False,
+    )
+    assert vectorized.max_statistic_p_values == scalar.max_statistic_p_values
+
+
 def main() -> None:
     test_similarity_missingness_cannot_help()
     test_stability_uses_magnitude_consistency()

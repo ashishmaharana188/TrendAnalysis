@@ -500,6 +500,7 @@ class PredictionEngine:
         entry_mode: str | None = None,
         validated_evidence: bool = False,
         validation_evidence: ValidationEvidenceAudit | None = None,
+        selected_relationships: dict[str, RelationshipRanking | None] | None = None,
     ) -> PredictionResult:
         """
         Build a pre-calibration prediction from training observations only.
@@ -529,14 +530,21 @@ class PredictionEngine:
         if thresholds.limited:
             limitations.append(thresholds.limitation or "Outcome thresholds are limited.")
 
-        discovered = self.relationship_engine.discover(
-            current_states=current_states,
-            observations=history,
-            cutoff_date=cutoff,
-        )
-
-        ranked_a = rank_relationships(discovered.get("method_a", []))
-        ranked_b = rank_relationships(discovered.get("method_b", []))
+        if selected_relationships is not None:
+            # Phase 5.8 nested validation supplies relationships that were
+            # selected only on an inner chronological holdout with FDR control.
+            # Do not re-rank the complete training universe here, which would
+            # reintroduce the in-sample winner's curse.
+            ranked_a = [selected_relationships["A"]] if selected_relationships.get("A") is not None else []
+            ranked_b = [selected_relationships["B"]] if selected_relationships.get("B") is not None else []
+        else:
+            discovered = self.relationship_engine.discover(
+                current_states=current_states,
+                observations=history,
+                cutoff_date=cutoff,
+            )
+            ranked_a = rank_relationships(discovered.get("method_a", []))
+            ranked_b = rank_relationships(discovered.get("method_b", []))
 
         provenance_audit = audit_prediction_provenance(
             observations=source_observations,

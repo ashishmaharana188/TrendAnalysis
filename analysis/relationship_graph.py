@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from functools import lru_cache
 from itertools import combinations
 from typing import Iterable
 
@@ -155,22 +156,28 @@ def structurally_connected(features: Iterable[str]) -> bool:
     return visited == families
 
 
-def candidate_feature_sets(features: Iterable[str], max_order: int) -> list[tuple[str, ...]]:
-    """Generate structurally valid 1..N feature candidates."""
+@lru_cache(maxsize=128)
+def _candidate_feature_sets_cached(features: tuple[str, ...], max_order: int) -> tuple[tuple[str, ...], ...]:
     if max_order < 1:
         raise ValueError("max_order must be >= 1")
 
-    features = sorted(set(str(feature) for feature in features))
     candidates: list[tuple[str, ...]] = [(feature,) for feature in features]
-
     if max_order >= 2:
         for left, right in combinations(features, 2):
             if compatible_pair(left, right):
                 candidates.append((left, right))
-
     for order in range(3, max_order + 1):
         for candidate in combinations(features, order):
             if structurally_connected(candidate):
                 candidates.append(candidate)
+    return tuple(candidates)
 
-    return candidates
+
+def candidate_feature_sets(features: Iterable[str], max_order: int) -> list[tuple[str, ...]]:
+    """Generate structurally valid 1..N feature candidates.
+
+    The immutable candidate universe is cached by feature set/order. This is a
+    pure performance optimization and cannot change which candidates are valid.
+    """
+    normalized = tuple(sorted(set(str(feature) for feature in features)))
+    return list(_candidate_feature_sets_cached(normalized, int(max_order)))

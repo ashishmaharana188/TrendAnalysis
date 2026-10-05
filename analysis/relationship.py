@@ -516,197 +516,158 @@ class RelationshipDiscoveryEngine:
         self,
         current_states: dict[str, str],
         history: list[HistoricalRelationshipObservation],
+        candidate_sets: Iterable[tuple[str, ...]] | None = None,
     ) -> list[RelationshipResult]:
-        """
-        Compare the complete current descriptive state with historical
-        observations using adaptive categorical similarity.
+        """Evaluate Method A for an explicit candidate universe.
 
-        Similarity is built from:
-
-        * current-state agreement at the variable level
-        * information content of the observed state
-        * structural family coverage
-        * an adaptive nearest-neighbour count based on available history
-
-        No fixed numeric tolerance is used because Phase 3 exposes
-        categorical states rather than raw numeric indicator values.
+        When ``candidate_sets`` is supplied, the candidate universe is unchanged
+        but feature/state comparisons are materialized once per call and reused
+        across candidates. This is a performance optimization only.
         """
         if not current_states or not history:
             return []
 
         baseline = history
+        features = list(current_states.keys())
+        candidates = (
+            [tuple(candidate) for candidate in candidate_sets]
+            if candidate_sets is not None
+            else _candidate_feature_sets(features, self.max_order)
+        )
+        if not candidates:
+            return []
 
-        # ----------------------------------------------------
-        # 1. Build adaptive feature weights. Rare informative
-        #    states receive more relevance, common states less.
-        # ----------------------------------------------------
         state_weights = _adaptive_relevance_weights(history)
-
-        current_features = tuple(sorted(current_states))
-
-        feature_weights: dict[str, float] = {}
-        for feature in current_features:
-            state = current_states[feature]
-            feature_weights[feature] = state_weights.get(
-                (feature, state),
-                1.0,
+        feature_index = {feature: idx for idx, feature in enumerate(features)}
+        feature_weight_vector = np.asarray(
+            [
+                max(float(state_weights.get((feature, current_states[feature]), 1.0)), 0.0)
+                for feature in features
+            ],
+            dtype=np.float64,
+        )
+        n = len(history)
+        match_matrix = np.zeros((len(features), n), dtype=np.uint8)
+        observed_matrix = np.zeros((len(features), n), dtype=np.uint8)
+        for feature, idx in feature_index.items():
+            current_state = current_states[feature]
+            observed_matrix[idx] = np.fromiter(
+                (1 if observation.states.get(feature) is not None else 0 for observation in history),
+                dtype=np.uint8, count=n,
+            )
+            match_matrix[idx] = np.fromiter(
+                (1 if observation.states.get(feature) == current_state else 0 for observation in history),
+                dtype=np.uint8, count=n,
             )
 
-        # ----------------------------------------------------
-        # 2. Family coverage is used only to keep one family from
-        #    dominating because it happens to contain many fields.
-        #    This is structural normalization, not an economic weight.
-        # ----------------------------------------------------
-        families: dict[str, list[str]] = {}
-        for feature in current_features:
-            families.setdefault(
-                _family(feature),
-                [],
-            ).append(feature)
-
-        def similarity(
-            observation: HistoricalRelationshipObservation,
-        ) -> tuple[float, float, float]:
-            diagnostics = categorical_similarity(
-                current_states=current_states,
-                observed_states=observation.states,
-                feature_weights=feature_weights,
-                family_lookup=_family,
-            )
-            return (
-                diagnostics.score,
-                diagnostics.state_coverage_pct,
-                diagnostics.family_coverage_pct,
-            )
-
-        scored = [
-            (observation, *similarity(observation))
-            for observation in history
-        ]
-
-        # A historical row must be sufficiently comparable before it may
-        # influence nearest-neighbour selection. Missingness now lowers
-        # similarity and is prevented from becoming a similarity advantage.
-        scored = [
-            item
-            for item in scored
-            if item[1] > 0.0
-            and item[2] >= self.min_state_coverage_pct
-            and item[3] >= self.min_family_coverage_pct
-        ]
-
-        if len(scored) < self.min_observations:
-            return []
-
-        # ----------------------------------------------------
-        # 3. Adaptive neighbourhood size. sqrt(N) grows slowly with
-        #    history and therefore avoids a fixed training-window rule.
-        # ----------------------------------------------------
-        neighbour_count = max(
-            self.min_observations,
-            int(
-                max(
-                    1,
-                    round(sqrt(len(scored))),
-                )
-            ),
-        )
-        neighbour_count = min(
-            neighbour_count,
-            len(scored),
-        )
-
-        scored.sort(
-            key=lambda item: (
-                item[1],
-                item[0].as_of_date,
-            ),
-            reverse=True,
-        )
-
-        neighbours = [
-            item[0]
-            for item in scored[:neighbour_count]
-        ]
-
-        neighbour_similarities = [
-            item[1]
-            for item in scored[:neighbour_count]
-        ]
-        neighbour_coverages = [
-            item[2]
-            for item in scored[:neighbour_count]
-        ]
-        neighbour_family_coverages = [
-            item[3]
-            for item in scored[:neighbour_count]
-        ]
-
-        result = _summary_result(
-            method="A",
-            variables=current_features,
-            condition=tuple(
-                f"{feature}~={current_states[feature]}"
-                for feature in current_features
-            ),
-            matching=neighbours,
-            baseline=baseline,
-        )
-
-        if result is None:
-            return []
-
-        # ----------------------------------------------------
-        # 4. Chronological stability check. A relation is stable
-        #    when the first/second halves of the selected neighbours
-        #    point in the same return direction.
-        # ----------------------------------------------------
-        ordered_neighbours = sorted(
-            neighbours,
-            key=lambda observation: observation.as_of_date,
-        )
-
-        stability = split_stability(
-            [item.stock_return_pct for item in ordered_neighbours],
-            sem_multiplier=self.stability_sem_multiplier,
-        )
-        stable = stability.stable
-
-        # Similarity is an evidence-quality multiplier. It is deliberately
-        # normalized to [0, 1] and does not assign bullish/bearish meaning.
-        mean_similarity = sum(neighbour_similarities) / len(
-            neighbour_similarities
-        )
-
-        adjusted_score = result.score * mean_similarity
+        outcomes = np.asarray([float(item.stock_return_pct) for item in history], dtype=np.float64)
+        baseline_mean = float(np.mean(outcomes))
+        baseline_dispersion = float(np.sqrt(np.mean((outcomes - baseline_mean) ** 2)))
         fit_dates = [item.as_of_date for item in history]
         fit_start = min(fit_dates) if fit_dates else None
         fit_end = max(fit_dates) if fit_dates else None
-        parameter_provenance = (
-            ("state_relevance_frequency", fit_start, fit_end),
-            ("method_a_adaptive_neighbor_count", fit_start, fit_end),
-        )
+        date_ordinals = np.asarray([item.as_of_date.toordinal() for item in history], dtype=np.int64)
+        min_obs = self.min_observations
+        results: list[RelationshipResult] = []
 
-        return [
-            RelationshipResult(
-                **{
-                    **result.__dict__,
-                    "score": adjusted_score,
-                    "stable": stable,
-                    "supporting_observations": tuple(
-                        (item.as_of_date, float(item.stock_return_pct))
-                        for item in neighbours
-                    ),
-                    "supporting_weights": tuple(
-                        1.0 for _ in neighbours
-                    ),
-                    "state_coverage_pct": sum(neighbour_coverages) / len(neighbour_coverages),
-                    "family_coverage_pct": sum(neighbour_family_coverages) / len(neighbour_family_coverages),
-                    "stability_score": stability.stability_score,
-                    "parameter_provenance": parameter_provenance,
-                }
-            )
-        ]
+        by_order: dict[int, list[tuple[str, ...]]] = {}
+        for candidate in candidates:
+            by_order.setdefault(len(candidate), []).append(candidate)
+
+        for order in sorted(by_order):
+            order_candidates = by_order[order]
+            batch_size = self.candidate_batch_size
+            for batch_start in range(0, len(order_candidates), batch_size):
+                batch = order_candidates[batch_start:batch_start + batch_size]
+                index_matrix = np.asarray(
+                    [[feature_index[feature] for feature in candidate] for candidate in batch],
+                    dtype=np.int32,
+                )
+                candidate_weights = feature_weight_vector[index_matrix]
+                observed = observed_matrix[index_matrix]
+                matches = match_matrix[index_matrix]
+                similarity = np.sum(matches, axis=1, dtype=np.float64) / float(order)
+                compared_weight = np.sum(
+                    candidate_weights[:, :, None] * observed, axis=1, dtype=np.float64
+                )
+                total_candidate_weight = np.sum(candidate_weights, axis=1)
+                state_coverage_pct = np.divide(
+                    compared_weight,
+                    total_candidate_weight[:, None],
+                    out=np.zeros_like(compared_weight),
+                    where=total_candidate_weight[:, None] > 0.0,
+                ) * 100.0
+                family_coverage_pct = np.sum(observed, axis=1, dtype=np.float64) / float(order) * 100.0
+                valid_mask = (
+                    (state_coverage_pct >= self.min_state_coverage_pct)
+                    & (family_coverage_pct >= self.min_family_coverage_pct)
+                    & (total_candidate_weight[:, None] > 0.0)
+                )
+                valid_counts = np.count_nonzero(valid_mask, axis=1)
+
+                for row_index, candidate in enumerate(batch):
+                    if valid_counts[row_index] < min_obs:
+                        continue
+                    valid_indices = np.flatnonzero(valid_mask[row_index] & (similarity[row_index] > 0.0))
+                    if len(valid_indices) < min_obs:
+                        continue
+                    neighbour_count = min(
+                        len(valid_indices),
+                        max(min_obs, int(max(1, round(sqrt(len(valid_indices)))))),
+                    )
+                    sort_indices = np.lexsort((
+                        -date_ordinals[valid_indices],
+                        -similarity[row_index, valid_indices],
+                    ))
+                    selected_indices = valid_indices[sort_indices[:neighbour_count]]
+                    selected = [history[index] for index in selected_indices]
+                    result = _summary_result(
+                        method='A',
+                        variables=candidate,
+                        condition=tuple(f'{feature}~={current_states[feature]}' for feature in candidate),
+                        matching=selected,
+                        baseline=baseline,
+                    )
+                    if result is None:
+                        continue
+                    ordered_neighbours = sorted(selected, key=lambda observation: observation.as_of_date)
+                    stability = split_stability(
+                        [item.stock_return_pct for item in ordered_neighbours],
+                        sem_multiplier=self.stability_sem_multiplier,
+                    )
+                    mean_similarity = float(np.mean(similarity[row_index, selected_indices]))
+                    results.append(
+                        RelationshipResult(
+                            **{
+                                **result.__dict__,
+                                'score': result.score * mean_similarity,
+                                'stable': stability.stable,
+                                'supporting_observations': (
+                                    tuple((item.as_of_date, float(item.stock_return_pct)) for item in selected)
+                                    if self.retain_supporting_data else ()
+                                ),
+                                'supporting_weights': (
+                                    tuple(1.0 for _ in selected)
+                                    if self.retain_supporting_data else ()
+                                ),
+                                'state_coverage_pct': float(np.mean(state_coverage_pct[row_index, selected_indices])),
+                                'family_coverage_pct': float(np.mean(family_coverage_pct[row_index, selected_indices])),
+                                'stability_score': stability.stability_score,
+                                'parameter_provenance': (
+                                    ('state_relevance_frequency', fit_start, fit_end),
+                                    ('method_a_adaptive_neighbor_count', fit_start, fit_end),
+                                ),
+                            }
+                        )
+                    )
+
+                if self.progress_callback is not None:
+                    processed = min(batch_start + len(batch), len(order_candidates))
+                    self._progress(
+                        f'Method A candidate progress {processed}/{len(order_candidates)} | results={len(results)}'
+                    )
+
+        return results
 
     # --------------------------------------------------------
     # Method B
@@ -716,6 +677,7 @@ class RelationshipDiscoveryEngine:
         self,
         current_states: dict[str, str],
         history: list[HistoricalRelationshipObservation],
+        candidate_sets: Iterable[tuple[str, ...]] | None = None,
     ) -> list[RelationshipResult]:
         """
         Method B: weighted historical distribution conditioned on the current
@@ -733,7 +695,11 @@ class RelationshipDiscoveryEngine:
         baseline = history
         features = list(current_states.keys())
         relevance = _adaptive_relevance_weights(history)
-        candidates = _candidate_feature_sets(features, self.max_order)
+        candidates = (
+            [tuple(candidate) for candidate in candidate_sets]
+            if candidate_sets is not None
+            else _candidate_feature_sets(features, self.max_order)
+        )
         self._progress(
             f"Method B search start | features={len(features)} | candidates={len(candidates)} | history={len(history)} | exhaustive=YES | batch={self.candidate_batch_size}"
         )
@@ -836,23 +802,38 @@ class RelationshipDiscoveryEngine:
                         last_progress = processed_candidates
                     continue
     
-                positive = np.where(
-                    valid_mask & (similarity > 0.0),
-                    similarity,
-                    np.nan,
-                )
-                with np.errstate(all="ignore"):
-                    scales = np.nanmedian(positive, axis=1)
+                # Similarity can be zero for every valid historical row, and in
+                # defensive cases it can contain non-finite values. Do not build an
+                # all-NaN row and do not rely on NaN * 0 cleanup: IEEE arithmetic
+                # keeps NaN alive, which then contaminates the weighted statistics.
+                finite_similarity = np.isfinite(similarity)
+                finite_valid_mask = valid_mask & finite_similarity
+                positive_mask = finite_valid_mask & (similarity > 0.0)
+                positive = np.where(positive_mask, similarity, np.nan)
+                has_positive = np.any(positive_mask, axis=1)
+                scales = np.ones(batch_len, dtype=np.float64)
+                if np.any(has_positive):
+                    # Only rows with at least one positive value reach nanmedian,
+                    # so the reduction cannot emit an all-NaN warning.
+                    scales[has_positive] = np.nanmedian(positive[has_positive], axis=1)
                 scales = np.where(np.isfinite(scales), np.maximum(scales, 1e-9), 1.0)
-    
+
                 valid_max = np.max(
-                    np.where(valid_mask, similarity, -np.inf),
+                    np.where(finite_valid_mask, similarity, -np.inf),
                     axis=1,
                 )
-                weights_full = np.exp(
-                    (similarity - valid_max[:, None]) / scales[:, None]
-                )
-                weights_full *= valid_mask
+                weights_full = np.zeros_like(similarity, dtype=np.float64)
+                valid_rows_for_weights = np.isfinite(valid_max)
+                if np.any(valid_rows_for_weights):
+                    row_ids = np.flatnonzero(valid_rows_for_weights)
+                    safe_similarity = similarity[row_ids]
+                    exponent = (
+                        safe_similarity - valid_max[row_ids, None]
+                    ) / scales[row_ids, None]
+                    finite_positions = finite_valid_mask[row_ids]
+                    weights = np.zeros_like(safe_similarity, dtype=np.float64)
+                    weights[finite_positions] = np.exp(exponent[finite_positions])
+                    weights_full[row_ids] = weights
                 total_weighted = np.sum(weights_full, axis=1)
                 usable = eligible_rows & (total_weighted > 0.0)
                 if not np.any(usable):

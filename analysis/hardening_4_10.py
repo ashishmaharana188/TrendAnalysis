@@ -7,6 +7,8 @@ from random import Random
 from statistics import mean
 from typing import Any, Iterable, Sequence
 
+import numpy as np
+
 
 def as_date(value: str | date | datetime) -> date:
     if isinstance(value, datetime):
@@ -265,6 +267,7 @@ def search_adjusted_permutation_p_values(
     universe_observations: Sequence[tuple[date, float]],
     permutations: int = 499,
     seed: int = 0,
+    compute_raw_p_values: bool = True,
 ) -> SearchAdjustedPermutationResult:
     """
     Compute max-statistic permutation p-values across a complete candidate family.
@@ -330,33 +333,69 @@ def search_adjusted_permutation_p_values(
         observed = abs(observed_mean - float(baseline_mean))
         observed_stats.append(observed)
         candidate_weights = [mapping.get(day, (universe[day], 0.0))[1] for day in dates]
-        raw_p_values.append(
-            empirical_permutation_p_value(
-                values,
-                candidate_weights,
-                baseline_mean,
-                permutations=permutations,
-                seed=seed + len(raw_p_values) + 1,
+        if compute_raw_p_values:
+            raw_p_values.append(
+                empirical_permutation_p_value(
+                    values,
+                    candidate_weights,
+                    baseline_mean,
+                    permutations=permutations,
+                    seed=seed + len(raw_p_values) + 1,
+                )
             )
-        )
+        else:
+            raw_p_values.append(float("nan"))
 
-    exceed = [1] * len(candidate_maps)
+    exceed = np.ones(len(candidate_maps), dtype=np.int64)
     rng = Random(seed)
-    for _ in range(permutations):
-        shuffled = list(values)
-        rng.shuffle(shuffled)
-        permuted_values = dict(zip(dates, shuffled))
-        max_stat = 0.0
-        for mapping in candidate_maps:
-            total_weight = sum(weight for _value, weight in mapping.values())
-            perm_mean = sum(
-                permuted_values[day] * weight
-                for day, (_value, weight) in mapping.items()
-            ) / total_weight
-            max_stat = max(max_stat, abs(perm_mean - float(baseline_mean)))
-        for index, observed in enumerate(observed_stats):
-            if max_stat >= observed:
-                exceed[index] += 1
+
+    if not compute_raw_p_values:
+        # The FDR gate consumes only the search-wide max-statistic p-values.
+        # Build one dense candidate-weight matrix and evaluate all candidates
+        # for each shared permutation with a BLAS-backed matrix multiply.
+        # This preserves the exact candidate universe and permutation count;
+        # only the implementation of the same statistic changes.
+        candidate_count = len(candidate_maps)
+        date_index = {day: index for index, day in enumerate(dates)}
+        weight_matrix = np.zeros((candidate_count, len(dates)), dtype=np.float64)
+        total_weights = np.zeros(candidate_count, dtype=np.float64)
+        for candidate_index, mapping in enumerate(candidate_maps):
+            total = 0.0
+            for day, (_value, weight) in mapping.items():
+                column = date_index[day]
+                weight_matrix[candidate_index, column] = float(weight)
+                total += float(weight)
+            total_weights[candidate_index] = total
+
+        observed_array = np.asarray(observed_stats, dtype=np.float64)
+        base_values = np.asarray(values, dtype=np.float64)
+        for _ in range(permutations):
+            permutation_indices = list(range(len(base_values)))
+            rng.shuffle(permutation_indices)
+            shuffled = base_values[np.asarray(permutation_indices, dtype=np.int64)]
+            permuted_means = (weight_matrix @ shuffled) / total_weights
+            max_stat = float(np.max(np.abs(permuted_means - float(baseline_mean))))
+            exceed += (max_stat >= observed_array)
+    else:
+        # Keep the original scalar path for callers that explicitly request
+        # per-candidate raw permutation p-values.
+        exceed = exceed.tolist()
+        rng = Random(seed)
+        for _ in range(permutations):
+            shuffled = list(values)
+            rng.shuffle(shuffled)
+            permuted_values = dict(zip(dates, shuffled))
+            max_stat = 0.0
+            for mapping in candidate_maps:
+                total_weight = sum(weight for _value, weight in mapping.values())
+                perm_mean = sum(
+                    permuted_values[day] * weight
+                    for day, (_value, weight) in mapping.items()
+                ) / total_weight
+                max_stat = max(max_stat, abs(perm_mean - float(baseline_mean)))
+            for index, observed in enumerate(observed_stats):
+                if max_stat >= observed:
+                    exceed[index] += 1
 
     adjusted = tuple(min(1.0, count / (permutations + 1)) for count in exceed)
     return SearchAdjustedPermutationResult(

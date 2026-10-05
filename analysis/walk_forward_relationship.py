@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import os
 
 from .hardening_4_10 import (
     audit_parameter_manifest,
@@ -43,6 +45,10 @@ class WalkForwardFold:
     method_a: dict | None
     method_b: dict | None
     combined: dict | None
+    # Internal Phase 5 hand-off: the relationship that survived the inner
+    # discovery -> selection -> FDR gate. These are never outer-test data.
+    selected_a_result: RelationshipResult | None = None
+    selected_b_result: RelationshipResult | None = None
 
     def as_dict(self) -> dict:
         return {
@@ -52,6 +58,8 @@ class WalkForwardFold:
             "method_a": self.method_a,
             "method_b": self.method_b,
             "combined": self.combined,
+            "selected_a_result": self.selected_a_result.as_dict() if self.selected_a_result else None,
+            "selected_b_result": self.selected_b_result.as_dict() if self.selected_b_result else None,
         }
 
 
@@ -339,54 +347,115 @@ def _discover_all_candidate_relationships(
     history: list[HistoricalRelationshipObservation],
     engine: RelationshipDiscoveryEngine,
 ) -> tuple[list[RelationshipResult], dict[int, int]]:
-    """Discover A/B evidence at every requested level using one structural graph.
+    """Discover the complete configured candidate universe.
 
-    Levels 1 and 2 are exhaustively enumerated from the canonical relationship
-    graph. Level 3+ is added through the adaptive higher-order engine, which
-    only expands evidence-supported parents and respects ``engine.max_order``.
+    ``adaptive_higher_order=True`` enables the exploratory Phase 4.6/4.7
+    frontier. In the production Phase 5.8 validation, the default is now
+    exhaustive: every structurally valid level 1..N candidate is evaluated.
+    Performance optimizations belong inside candidate evaluation, not in the
+    candidate universe.
     """
     if not current_states or not history:
         return [], {}
 
     discovered: dict[tuple[str, tuple[str, ...]], RelationshipResult] = {}
-    counts: dict[int, int] = {}
 
-    base_order = min(engine.max_order, 2)
-    for candidate in candidate_feature_sets(current_states.keys(), base_order):
-        subset = {feature: current_states[feature] for feature in candidate}
-        candidate_engine = RelationshipDiscoveryEngine(
-            max_order=len(candidate),
-            min_observations=engine.min_observations,
-            min_state_coverage_pct=engine.min_state_coverage_pct,
-            min_family_coverage_pct=engine.min_family_coverage_pct,
-            stability_sem_multiplier=engine.stability_sem_multiplier,
-        )
-        results = (
-            candidate_engine.method_a_similar_states(subset, history)
-            + candidate_engine.method_b_conditioned_distribution(subset, history)
-        )
-        for result in results:
-            if tuple(sorted(result.variables)) != tuple(sorted(candidate)):
-                continue
-            discovered[(result.method, tuple(sorted(result.variables)))] = result
-
-    if engine.max_order >= 3:
-        from .adaptive_combination import discover_adaptive_higher_order
-
-        adaptive = discover_adaptive_higher_order(
-            current_states=current_states,
-            history=history,
-            engine=engine,
-        )
-        for ranking in adaptive.rankings:
-            for result in ranking.method_results:
-                if len(result.variables) < 3:
+    if engine.adaptive_higher_order:
+        base_order = min(engine.max_order, 2)
+        for candidate in candidate_feature_sets(current_states.keys(), base_order):
+            subset = {feature: current_states[feature] for feature in candidate}
+            candidate_engine = RelationshipDiscoveryEngine(
+                max_order=len(candidate),
+                min_observations=engine.min_observations,
+                min_state_coverage_pct=engine.min_state_coverage_pct,
+                min_family_coverage_pct=engine.min_family_coverage_pct,
+                stability_sem_multiplier=engine.stability_sem_multiplier,
+            )
+            results = (
+                candidate_engine.method_a_similar_states(subset, history)
+                + candidate_engine.method_b_conditioned_distribution(subset, history)
+            )
+            for result in results:
+                if tuple(sorted(result.variables)) != tuple(sorted(candidate)):
                     continue
                 discovered[(result.method, tuple(sorted(result.variables)))] = result
 
+        if engine.max_order >= 3:
+            from .adaptive_combination import discover_adaptive_higher_order
+            adaptive = discover_adaptive_higher_order(
+                current_states=current_states,
+                history=history,
+                engine=engine,
+            )
+            for ranking in adaptive.rankings:
+                for result in ranking.method_results:
+                    if len(result.variables) < 3:
+                        continue
+                    discovered[(result.method, tuple(sorted(result.variables)))] = result
+    else:
+        # Exact exhaustive universe. No performance-driven candidate pruning.
+        candidates = candidate_feature_sets(current_states.keys(), engine.max_order)
+        by_order: dict[int, list[tuple[str, ...]]] = {}
+        for candidate in candidates:
+            by_order.setdefault(len(candidate), []).append(candidate)
+
+        progress_every = max(1, int(engine.progress_every_candidates))
+        total_candidates = len(candidates)
+        processed_total = 0
+        progress = engine.progress_callback
+        if progress is not None:
+            progress(
+                f"Nested discovery start | features={len(current_states)} | "
+                f"history={len(history)} | candidates={total_candidates} | exhaustive=YES"
+            )
+
+        for order in sorted(by_order):
+            order_candidates = by_order[order]
+            if progress is not None:
+                progress(
+                    f"Nested discovery L{order} start | candidates={len(order_candidates)} | "
+                    f"processed={processed_total}/{total_candidates}"
+                )
+
+            # Evaluate the entire order in vectorized batches. The previous
+            # implementation called the vectorized engine once per candidate,
+            # reducing the optimization to batch_size=1 and repeating the
+            # feature/history matrix construction tens of thousands of times.
+            candidate_engine = RelationshipDiscoveryEngine(
+                max_order=order,
+                min_observations=engine.min_observations,
+                min_state_coverage_pct=engine.min_state_coverage_pct,
+                min_family_coverage_pct=engine.min_family_coverage_pct,
+                stability_sem_multiplier=engine.stability_sem_multiplier,
+                progress_callback=None,
+                progress_every_candidates=engine.progress_every_candidates,
+                candidate_batch_size=engine.candidate_batch_size,
+                # Discovery results are only candidate definitions/provenance
+                # for the inner holdout. Their support is recomputed there.
+                retain_supporting_data=False,
+            )
+            results_a = candidate_engine.method_a_similar_states(
+                current_states, history, candidate_sets=order_candidates
+            )
+            results_b = candidate_engine.method_b_conditioned_distribution(
+                current_states, history, candidate_sets=order_candidates
+            )
+            for result in (*results_a, *results_b):
+                key = (result.method, tuple(sorted(result.variables)))
+                discovered[key] = result
+
+            processed_total += len(order_candidates)
+            if progress is not None:
+                progress(
+                    f"Nested discovery L{order} progress "
+                    f"{len(order_candidates)}/{len(order_candidates)} | "
+                    f"total={processed_total}/{total_candidates} | "
+                    f"results={len(discovered)}"
+                )
+
+    counts: dict[int, int] = {}
     for _method, variables in discovered:
         counts[len(variables)] = counts.get(len(variables), 0) + 1
-
     return list(discovered.values()), counts
 
 
@@ -431,20 +500,49 @@ def _holdout_select(
     evaluations: list[object] = []
     baseline_mean = sum(item.stock_return_pct for item in selection_history) / len(selection_history)
 
-    for candidate in discovery_results:
-        evaluated = _method_results_for_candidate(
-            method,
-            tuple(candidate.variables),
-            current_states,
-            selection_history,
-            engine,
+    progress = engine.progress_callback
+    progress_every = max(1, int(engine.progress_every_candidates))
+    total_candidates = len(discovery_results)
+    if progress is not None:
+        progress(
+            f"Nested selection {method} start | candidates={total_candidates} | "
+            f"history={len(selection_history)}"
         )
-        if evaluated is None or not getattr(evaluated, "supporting_observations", None):
-            continue
-        evaluations.append(evaluated)
+
+    # Re-evaluate all discovered candidates in vectorized batches on the inner
+    # holdout. This is the same chronological selection test, but avoids invoking
+    # a 1-candidate search for every relationship.
+    candidate_variables = [tuple(candidate.variables) for candidate in discovery_results]
+    if candidate_variables:
+        evaluated_results = (
+            engine.method_a_similar_states(current_states, selection_history, candidate_sets=candidate_variables)
+            if method == "A"
+            else engine.method_b_conditioned_distribution(current_states, selection_history, candidate_sets=candidate_variables)
+        )
+        by_variables = {tuple(sorted(item.variables)): item for item in evaluated_results}
+        evaluations = [
+            by_variables[tuple(sorted(candidate.variables))]
+            for candidate in discovery_results
+            if tuple(sorted(candidate.variables)) in by_variables
+            and getattr(by_variables[tuple(sorted(candidate.variables))], "supporting_observations", None)
+        ]
+
+    if progress is not None:
+        progress(
+            f"Nested selection {method} progress "
+            f"{total_candidates}/{total_candidates} | evaluations={len(evaluations)}"
+        )
 
     if not evaluations:
+        if progress is not None:
+            progress(f"Nested selection {method} complete | evaluations=0 | accepted=0")
         return None, 0, False
+
+    if progress is not None:
+        progress(
+            f"Nested selection {method} FDR start | evaluations={len(evaluations)} | "
+            f"permutations=199"
+        )
 
     permutation = search_adjusted_permutation_p_values(
         [
@@ -459,13 +557,25 @@ def _holdout_select(
         ],
         permutations=199,
         seed=sum(ord(ch) for ch in family.family_id) + len(selection_history),
+        compute_raw_p_values=False,
     )
     adjusted, accepted = benjamini_hochberg(
         permutation.max_statistic_p_values,
         alpha=alpha,
     )
     if not accepted:
+        if progress is not None:
+            progress(
+                f"Nested selection {method} FDR complete | evaluations={len(evaluations)} | "
+                f"accepted=0"
+            )
         return None, len(evaluations), True
+
+    if progress is not None:
+        progress(
+            f"Nested selection {method} FDR complete | evaluations={len(evaluations)} | "
+            f"accepted={len(accepted)}"
+        )
 
     accepted_rows = [
         (evaluations[index], adjusted[index])
@@ -479,7 +589,163 @@ def _holdout_select(
             -float(row[0].reliability),
         ),
     )
+    if progress is not None:
+        progress(
+            f"Nested selection {method} complete | evaluations={len(evaluations)} | "
+            f"accepted={len(accepted)} | selected_order={len(selected.variables)}"
+        )
     return selected, len(evaluations), True
+
+
+
+def _run_hardened_fold(
+    fold_index: int,
+    total_folds: int,
+    test_observation: HistoricalRelationshipObservation,
+    training: list[HistoricalRelationshipObservation],
+    discovery_history: list[HistoricalRelationshipObservation],
+    selection_history: list[HistoricalRelationshipObservation],
+    engine_config: dict[str, object],
+    multiple_testing_alpha: float,
+    progress_enabled: bool,
+) -> dict[str, object]:
+    """Execute one hardened outer fold.
+
+    The fold is self-contained: it only reads the supplied chronological
+    histories and test observation. This makes folds safe to execute concurrently
+    without changing the walk-forward information boundary.
+    """
+    prediction_date = _as_date(test_observation.as_of_date)
+
+    def progress(message: str) -> None:
+        if progress_enabled:
+            print(f"[Phase 5.8] Fold {fold_index}/{total_folds} | {message}", flush=True)
+
+    progress(
+        f"start | prediction_date={prediction_date} | training={len(training)} | "
+        f"discovery={len(discovery_history)} | selection={len(selection_history)}"
+    )
+
+    discovery_engine = RelationshipDiscoveryEngine(
+        max_order=int(engine_config["max_order"]),
+        min_observations=int(engine_config["min_observations"]),
+        min_state_coverage_pct=float(engine_config["min_state_coverage_pct"]),
+        min_family_coverage_pct=float(engine_config["min_family_coverage_pct"]),
+        stability_sem_multiplier=float(engine_config["stability_sem_multiplier"]),
+        adaptive_higher_order=bool(engine_config["adaptive_higher_order"]),
+        progress_callback=progress,
+        progress_every_candidates=int(engine_config["progress_every_candidates"]),
+        candidate_batch_size=int(engine_config["candidate_batch_size"]),
+        # Discovery support is not consumed by inner selection. Re-materializing
+        # it there avoids millions of Python tuples per outer fold.
+        retain_supporting_data=False,
+    )
+
+    progress(
+        f"discovery input | discovery_history={len(discovery_history)} | "
+        f"selection_history={len(selection_history)} | features={len(test_observation.states)}"
+    )
+    discovered_results, candidate_counts = _discover_all_candidate_relationships(
+        test_observation.states,
+        discovery_history,
+        discovery_engine,
+    )
+    progress(
+        f"discovery complete | relationships={len(discovered_results)} | counts={candidate_counts}"
+    )
+
+    discovery_a = [item for item in discovered_results if item.method == "A"]
+    discovery_b = [item for item in discovered_results if item.method == "B"]
+    required_a = ("state_relevance_frequency", "method_a_adaptive_neighbor_count")
+    required_b = ("state_relevance_frequency", "method_b_similarity_scale")
+    audits_a = [
+        audit_parameter_manifest(required_a, result.parameter_provenance, prediction_date)
+        for result in discovery_a
+    ]
+    audits_b = [
+        audit_parameter_manifest(required_b, result.parameter_provenance, prediction_date)
+        for result in discovery_b
+    ]
+    if any(audit.temporal_violation for audit in (*audits_a, *audits_b)):
+        return {
+            "status": "leakage",
+            "fold_index": fold_index,
+            "leakage_violations": 1,
+            "purged_training": 0,
+            "unknown_overlap": 0,
+        }
+    if any(not audit.complete for audit in (*audits_a, *audits_b)):
+        return {
+            "status": "insufficient",
+            "fold_index": fold_index,
+            "leakage_violations": 0,
+            "purged_training": 0,
+            "unknown_overlap": 0,
+        }
+
+    family_a = TestingFamily(
+        target=test_observation.target,
+        scope=test_observation.scope,
+        method="A",
+        prediction_date=prediction_date,
+    )
+    family_b = TestingFamily(
+        target=test_observation.target,
+        scope=test_observation.scope,
+        method="B",
+        prediction_date=prediction_date,
+    )
+
+    progress(f"selection input | A_candidates={len(discovery_a)} | B_candidates={len(discovery_b)}")
+    selected_a, count_a, controlled_a = _holdout_select(
+        "A", discovery_a, test_observation.states, selection_history,
+        discovery_engine, family_a, alpha=multiple_testing_alpha,
+    )
+    selected_b, count_b, controlled_b = _holdout_select(
+        "B", discovery_b, test_observation.states, selection_history,
+        discovery_engine, family_b, alpha=multiple_testing_alpha,
+    )
+
+    ranking_a = _top_ranking([selected_a] if selected_a is not None else [])
+    ranking_b = _top_ranking([selected_b] if selected_b is not None else [])
+    actual_return = float(test_observation.stock_return_pct)
+    row_a = _fold_result(ranking_a, actual_return)
+    row_b = _fold_result(ranking_b, actual_return)
+    common_ranking = (
+        ranking_a
+        if ranking_a is not None and ranking_b is not None and ranking_a.direction == ranking_b.direction
+        else None
+    )
+    row_combined = _fold_result(common_ranking, actual_return)
+
+    progress(
+        f"complete | selected_A={selected_a is not None} | selected_B={selected_b is not None} | "
+        f"A_evals={count_a} | B_evals={count_b}"
+    )
+    return {
+        "status": "complete",
+        "fold_index": fold_index,
+        "fold": WalkForwardFold(
+            prediction_date=prediction_date,
+            training_observations=len(training),
+            actual_return_pct=actual_return,
+            method_a=row_a,
+            method_b=row_b,
+            combined=row_combined,
+            selected_a_result=selected_a,
+            selected_b_result=selected_b,
+        ),
+        "row_a": row_a,
+        "row_b": row_b,
+        "row_combined": row_combined,
+        "count_a": count_a,
+        "count_b": count_b,
+        "controlled": int(controlled_a or controlled_b),
+        "selection_validated": int(selected_a is not None or selected_b is not None),
+        "leakage_violations": 0,
+        "purged_training": 0,
+        "unknown_overlap": 0,
+    }
 
 
 def validate_walk_forward_relationships_hardened(
@@ -490,6 +756,7 @@ def validate_walk_forward_relationships_hardened(
     selection_fraction: float = 0.30,
     multiple_testing_alpha: float = 0.10,
     purge_overlapping_labels: bool = True,
+    parallel_workers: int = 1,
 ) -> WalkForwardValidationResult:
     """
     Methodological-hardening validator for Phase 4.10.
@@ -528,6 +795,22 @@ def validate_walk_forward_relationships_hardened(
     selection_validated = 0
     controlled_folds = 0
 
+    worker_count = max(1, int(parallel_workers))
+    if worker_count > 1:
+        worker_count = min(worker_count, max(1, int(os.cpu_count() or 1)))
+
+    engine_config = {
+        "max_order": engine.max_order,
+        "min_observations": engine.min_observations,
+        "min_state_coverage_pct": engine.min_state_coverage_pct,
+        "min_family_coverage_pct": engine.min_family_coverage_pct,
+        "stability_sem_multiplier": engine.stability_sem_multiplier,
+        "adaptive_higher_order": engine.adaptive_higher_order,
+        "progress_every_candidates": engine.progress_every_candidates,
+        "candidate_batch_size": engine.candidate_batch_size,
+    }
+
+    jobs: list[tuple[int, HistoricalRelationshipObservation, list[HistoricalRelationshipObservation], list[HistoricalRelationshipObservation], list[HistoricalRelationshipObservation]]] = []
     for index, test_observation in enumerate(rows):
         prediction_date = _as_date(test_observation.as_of_date)
         raw_training = [
@@ -565,103 +848,62 @@ def validate_walk_forward_relationships_hardened(
         if len(discovery_history) < minimum or len(selection_history) < engine.min_observations:
             skipped_insufficient_history += 1
             continue
+        jobs.append((index, test_observation, training, discovery_history, selection_history))
 
-        discovery_engine = RelationshipDiscoveryEngine(
-            max_order=engine.max_order,
-            min_observations=engine.min_observations,
-            min_state_coverage_pct=engine.min_state_coverage_pct,
-            min_family_coverage_pct=engine.min_family_coverage_pct,
-            stability_sem_multiplier=engine.stability_sem_multiplier,
-        )
-        discovered_results, _candidate_counts = _discover_all_candidate_relationships(
-            test_observation.states,
+    def submit_args(job):
+        index, observation, training, discovery_history, selection_history = job
+        return _run_hardened_fold(
+            index + 1,
+            len(rows),
+            observation,
+            training,
             discovery_history,
-            discovery_engine,
+            selection_history,
+            engine_config,
+            multiple_testing_alpha,
+            bool(engine.progress_callback is not None),
         )
-        discovery_a = [item for item in discovered_results if item.method == "A"]
-        discovery_b = [item for item in discovered_results if item.method == "B"]
 
-        required_a = (
-            "state_relevance_frequency",
-            "method_a_adaptive_neighbor_count",
-        )
-        required_b = (
-            "state_relevance_frequency",
-            "method_b_similarity_scale",
-        )
-        audits_a = [
-            audit_parameter_manifest(required_a, result.parameter_provenance, prediction_date)
-            for result in discovery_a
-        ]
-        audits_b = [
-            audit_parameter_manifest(required_b, result.parameter_provenance, prediction_date)
-            for result in discovery_b
-        ]
-        if any(audit.temporal_violation for audit in (*audits_a, *audits_b)):
+    completed_results: list[dict[str, object]] = []
+    if worker_count == 1:
+        for job in jobs:
+            completed_results.append(submit_args(job))
+    else:
+        print(f"[Phase 5.8] Parallel fold execution | workers={worker_count} | runnable_folds={len(jobs)}", flush=True)
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="phase5-fold") as executor:
+            future_map = {executor.submit(submit_args, job): job[0] + 1 for job in jobs}
+            for future in as_completed(future_map):
+                result = future.result()
+                completed_results.append(result)
+                print(
+                    f"[Phase 5.8] Parallel fold complete | fold={result.get('fold_index')} | "
+                    f"completed={len(completed_results)}/{len(jobs)}",
+                    flush=True,
+                )
+
+    completed_results.sort(key=lambda item: int(item["fold_index"]))
+    for result in completed_results:
+        status = result.get("status")
+        if status == "leakage":
             leakage_violations += 1
             continue
-        if any(not audit.complete for audit in (*audits_a, *audits_b)):
+        if status == "insufficient":
             skipped_insufficient_history += 1
             continue
-
-        family_a = TestingFamily(
-            target=test_observation.target,
-            scope=test_observation.scope,
-            method="A",
-            prediction_date=prediction_date,
-        )
-        family_b = TestingFamily(
-            target=test_observation.target,
-            scope=test_observation.scope,
-            method="B",
-            prediction_date=prediction_date,
-        )
-
-        selected_a, count_a, controlled_a = _holdout_select(
-            "A", discovery_a, test_observation.states, selection_history, discovery_engine, family_a, alpha=multiple_testing_alpha
-        )
-        selected_b, count_b, controlled_b = _holdout_select(
-            "B", discovery_b, test_observation.states, selection_history, discovery_engine, family_b, alpha=multiple_testing_alpha
-        )
-        selection_evaluations += count_a + count_b
-        if controlled_a or controlled_b:
-            controlled_folds += 1
-        if selected_a is not None or selected_b is not None:
-            selection_validated += 1
-
-        # The selected inner-holdout result supplies the directional prediction
-        # for the outer test date. No test outcome enters this step.
-        ranking_a = _top_ranking([selected_a] if selected_a is not None else [])
-        ranking_b = _top_ranking([selected_b] if selected_b is not None else [])
-
-        row_a = _fold_result(ranking_a, float(test_observation.stock_return_pct))
-        row_b = _fold_result(ranking_b, float(test_observation.stock_return_pct))
-
-        common_ranking = None
-        if ranking_a is not None and ranking_b is not None and ranking_a.direction == ranking_b.direction:
-            common_ranking = ranking_a
-        row_combined = _fold_result(common_ranking, float(test_observation.stock_return_pct))
-
-        if row_a is None and row_b is None and row_combined is None:
-            skipped_no_relationship += 1
-
+        fold = result["fold"]
+        folds.append(fold)  # type: ignore[arg-type]
+        row_a = result.get("row_a")
+        row_b = result.get("row_b")
+        row_combined = result.get("row_combined")
         if row_a is not None:
-            method_a_rows.append(row_a)
+            method_a_rows.append(row_a)  # type: ignore[arg-type]
         if row_b is not None:
-            method_b_rows.append(row_b)
+            method_b_rows.append(row_b)  # type: ignore[arg-type]
         if row_combined is not None:
-            combined_rows.append(row_combined)
-
-        folds.append(
-            WalkForwardFold(
-                prediction_date=prediction_date,
-                training_observations=len(training),
-                actual_return_pct=float(test_observation.stock_return_pct),
-                method_a=row_a,
-                method_b=row_b,
-                combined=row_combined,
-            )
-        )
+            combined_rows.append(row_combined)  # type: ignore[arg-type]
+        selection_evaluations += int(result.get("count_a", 0)) + int(result.get("count_b", 0))
+        controlled_folds += int(result.get("controlled", 0))
+        selection_validated += int(result.get("selection_validated", 0))
 
     evaluated = len(folds)
     return WalkForwardValidationResult(

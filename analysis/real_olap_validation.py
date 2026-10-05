@@ -102,8 +102,11 @@ class RealOLAPValidationConfig:
     progress_logging: bool = True
     progress_every: int = 10
     adaptive_relationship_search: bool = False
+    selection_fraction: float = 0.30
+    multiple_testing_alpha: float = 0.10
     relationship_progress_every_candidates: int = 1000
     relationship_candidate_batch_size: int = 512
+    phase5_parallel_workers: int = 1
 
 
 @dataclass(frozen=True)
@@ -1339,6 +1342,7 @@ def validate_real_olap_relationships(
             engine=engine,
             min_training_observations=config.min_training_observations,
             purge_overlapping_labels=True,
+            parallel_workers=int(getattr(config, "phase5_parallel_workers", 1)),
         )
     else:
         _progress(config.progress_logging, "Walk-forward validation start | hardened=False")

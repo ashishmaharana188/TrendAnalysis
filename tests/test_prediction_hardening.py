@@ -252,6 +252,64 @@ def test_prediction_provenance_is_auditable() -> None:
     assert data["temporal_violations"] == 0
 
 
+
+def test_selected_relationships_bypass_in_sample_rediscovery() -> None:
+    from analysis.prediction import PredictionEngine
+    from analysis.relationship import RelationshipDiscoveryEngine, RelationshipResult
+    from analysis.ranking import rank_relationships
+
+    class FailingDiscoveryEngine(RelationshipDiscoveryEngine):
+        def discover(self, current_states, observations, cutoff_date):  # type: ignore[override]
+            raise AssertionError("in-sample discovery must not run for selected relationships")
+
+    base = date(2025, 1, 1)
+    history = [
+        _obs(
+            base + timedelta(days=index * 10),
+            base + timedelta(days=index * 10 + 3),
+            ret=float((index % 3) - 1),
+        )
+        for index in range(20)
+    ]
+    selected = RelationshipResult(
+        method="B",
+        variables=("company.market.price",),
+        condition=("company.market.price=Rising",),
+        sample_count=5,
+        mean_return_pct=2.0,
+        median_return_pct=2.0,
+        baseline_mean_return_pct=0.0,
+        lift_pct=2.0,
+        positive_rate_pct=80.0,
+        effect_strength=0.8,
+        reliability=0.8,
+        score=0.8,
+        stable=True,
+        supporting_observations=tuple(
+            (item.as_of_date, float(item.stock_return_pct)) for item in history[-5:]
+        ),
+        supporting_weights=(1.0,) * 5,
+        parameter_provenance=(
+            ("state_relevance_frequency", history[0].as_of_date, history[-5].outcome_end_date),
+            ("method_b_similarity_scale", history[0].as_of_date, history[-5].outcome_end_date),
+        ),
+    )
+    ranking = rank_relationships([selected])[0]
+    engine = PredictionEngine(
+        relationship_engine=FailingDiscoveryEngine(max_order=1, min_observations=5),
+        min_threshold_observations=3,
+    )
+    result = engine.predict(
+        target="TEST",
+        current_states={"company.market.price": "Rising"},
+        observations=history,
+        prediction_date=date(2026, 1, 1),
+        selected_relationships={"A": None, "B": ranking},
+    )
+    assert result.method_b is not None
+    assert result.method_b.variables == ("company.market.price",)
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
