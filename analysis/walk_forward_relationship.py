@@ -10,7 +10,6 @@ from .hardening_4_10 import (
     audit_parameter_manifest,
     search_adjusted_permutation_p_values,
     TestingFamily,
-    benjamini_hochberg,
 )
 
 from .ranking import RelationshipRanking, rank_relationships
@@ -341,7 +340,6 @@ def validate_walk_forward_relationships(
     )
 
 
-
 def _discover_all_candidate_relationships(
     current_states: dict[str, str],
     history: list[HistoricalRelationshipObservation],
@@ -399,7 +397,6 @@ def _discover_all_candidate_relationships(
         for candidate in candidates:
             by_order.setdefault(len(candidate), []).append(candidate)
 
-        progress_every = max(1, int(engine.progress_every_candidates))
         total_candidates = len(candidates)
         processed_total = 0
         progress = engine.progress_callback
@@ -491,17 +488,28 @@ def _holdout_select(
 
     Discovery candidates are fixed before the selection set is touched. Each
     candidate is independently re-evaluated on the selection set, then the
-    empirical p-values are FDR-adjusted. No candidate with a failed adjustment
-    is promoted to the outer test prediction.
+    complete candidate family is evaluated with a search-wide max-statistic
+    permutation test. The returned p-values are already adjusted for the
+    candidate search family, so they are thresholded directly at ``alpha``.
+    Applying BH again to these already search-adjusted p-values would double-
+    penalize the same search and can make the gate effectively impossible to
+    pass when the exhaustive universe contains hundreds of thousands of
+    candidates.
     """
     if not discovery_results or not selection_history:
         return None, 0, False
+
+    if not engine.retain_supporting_data:
+        raise RuntimeError(
+            "Nested selection requires retain_supporting_data=True because "
+            "search-wide permutation testing consumes each candidate's exact "
+            "supporting observations and weights."
+        )
 
     evaluations: list[object] = []
     baseline_mean = sum(item.stock_return_pct for item in selection_history) / len(selection_history)
 
     progress = engine.progress_callback
-    progress_every = max(1, int(engine.progress_every_candidates))
     total_candidates = len(discovery_results)
     if progress is not None:
         progress(
@@ -513,24 +521,65 @@ def _holdout_select(
     # holdout. This is the same chronological selection test, but avoids invoking
     # a 1-candidate search for every relationship.
     candidate_variables = [tuple(candidate.variables) for candidate in discovery_results]
+    evaluated_results: list[RelationshipResult] = []
     if candidate_variables:
         evaluated_results = (
-            engine.method_a_similar_states(current_states, selection_history, candidate_sets=candidate_variables)
+            engine.method_a_similar_states(
+                current_states,
+                selection_history,
+                candidate_sets=candidate_variables,
+            )
             if method == "A"
-            else engine.method_b_conditioned_distribution(current_states, selection_history, candidate_sets=candidate_variables)
+            else engine.method_b_conditioned_distribution(
+                current_states,
+                selection_history,
+                candidate_sets=candidate_variables,
+            )
         )
-        by_variables = {tuple(sorted(item.variables)): item for item in evaluated_results}
-        evaluations = [
-            by_variables[tuple(sorted(candidate.variables))]
-            for candidate in discovery_results
-            if tuple(sorted(candidate.variables)) in by_variables
-            and getattr(by_variables[tuple(sorted(candidate.variables))], "supporting_observations", None)
-        ]
+
+    by_variables = {tuple(sorted(item.variables)): item for item in evaluated_results}
+
+    supportful_results = [
+        item
+        for item in evaluated_results
+        if bool(getattr(item, "supporting_observations", ()))
+        and bool(getattr(item, "supporting_weights", ()))
+    ]
+
+    evaluations = [
+        by_variables[tuple(sorted(candidate.variables))]
+        for candidate in discovery_results
+        if tuple(sorted(candidate.variables)) in by_variables
+        and bool(
+            getattr(
+                by_variables[tuple(sorted(candidate.variables))],
+                "supporting_observations",
+                (),
+            )
+        )
+        and bool(
+            getattr(
+                by_variables[tuple(sorted(candidate.variables))],
+                "supporting_weights",
+                (),
+            )
+        )
+    ]
 
     if progress is not None:
         progress(
             f"Nested selection {method} progress "
-            f"{total_candidates}/{total_candidates} | evaluations={len(evaluations)}"
+            f"{total_candidates}/{total_candidates} | "
+            f"re_evaluated={len(evaluated_results)} | "
+            f"supportful={len(supportful_results)} | "
+            f"evaluations={len(evaluations)}"
+        )
+
+    if evaluated_results and not evaluations:
+        raise RuntimeError(
+            "Nested selection produced re-evaluated relationships but none "
+            "contained usable supporting observations/weights. "
+            "This indicates a support-retention or candidate-evaluation wiring error."
         )
 
     if not evaluations:
@@ -540,8 +589,8 @@ def _holdout_select(
 
     if progress is not None:
         progress(
-            f"Nested selection {method} FDR start | evaluations={len(evaluations)} | "
-            f"permutations=199"
+            f"Nested selection {method} search-adjusted gate start | "
+            f"evaluations={len(evaluations)} | permutations=199 | alpha={alpha:.3f}"
         )
 
     permutation = search_adjusted_permutation_p_values(
@@ -559,22 +608,32 @@ def _holdout_select(
         seed=sum(ord(ch) for ch in family.family_id) + len(selection_history),
         compute_raw_p_values=False,
     )
-    adjusted, accepted = benjamini_hochberg(
-        permutation.max_statistic_p_values,
-        alpha=alpha,
+    # ``max_statistic_p_values`` are already search-adjusted: for each
+    # candidate the p-value asks how often the *maximum* null statistic across
+    # the entire candidate family is at least as extreme as that candidate's
+    # observed statistic. They therefore control the family-wise search error
+    # directly and must be thresholded as adjusted p-values. Running BH on
+    # these values again is redundant double correction.
+    adjusted = tuple(float(value) for value in permutation.max_statistic_p_values)
+    accepted = tuple(
+        index
+        for index, p_value in enumerate(adjusted)
+        if p_value <= float(alpha)
     )
     if not accepted:
         if progress is not None:
             progress(
-                f"Nested selection {method} FDR complete | evaluations={len(evaluations)} | "
-                f"accepted=0"
+                f"Nested selection {method} search-adjusted gate complete | "
+                f"evaluations={len(evaluations)} | accepted=0 | "
+                f"min_adjusted_p={min(adjusted):.6f}"
             )
         return None, len(evaluations), True
 
     if progress is not None:
         progress(
-            f"Nested selection {method} FDR complete | evaluations={len(evaluations)} | "
-            f"accepted={len(accepted)}"
+            f"Nested selection {method} search-adjusted gate complete | "
+            f"evaluations={len(evaluations)} | accepted={len(accepted)} | "
+            f"min_adjusted_p={min(adjusted):.6f}"
         )
 
     accepted_rows = [
@@ -592,10 +651,10 @@ def _holdout_select(
     if progress is not None:
         progress(
             f"Nested selection {method} complete | evaluations={len(evaluations)} | "
-            f"accepted={len(accepted)} | selected_order={len(selected.variables)}"
+            f"accepted={len(accepted)} | selected_order={len(selected.variables)} | "
+            f"selected_adjusted_p={_q:.6f}"
         )
     return selected, len(evaluations), True
-
 
 
 def _run_hardened_fold(
@@ -683,6 +742,21 @@ def _run_hardened_fold(
             "unknown_overlap": 0,
         }
 
+    # Discovery remains memory-light. Inner selection needs exact support for
+    # search-wide permutation testing, so it uses a separate engine.
+    selection_engine = RelationshipDiscoveryEngine(
+        max_order=int(engine_config["max_order"]),
+        min_observations=int(engine_config["min_observations"]),
+        min_state_coverage_pct=float(engine_config["min_state_coverage_pct"]),
+        min_family_coverage_pct=float(engine_config["min_family_coverage_pct"]),
+        stability_sem_multiplier=float(engine_config["stability_sem_multiplier"]),
+        adaptive_higher_order=bool(engine_config["adaptive_higher_order"]),
+        progress_callback=progress,
+        progress_every_candidates=int(engine_config["progress_every_candidates"]),
+        candidate_batch_size=int(engine_config["candidate_batch_size"]),
+        retain_supporting_data=True,
+    )
+
     family_a = TestingFamily(
         target=test_observation.target,
         scope=test_observation.scope,
@@ -696,14 +770,17 @@ def _run_hardened_fold(
         prediction_date=prediction_date,
     )
 
-    progress(f"selection input | A_candidates={len(discovery_a)} | B_candidates={len(discovery_b)}")
+    progress(
+        f"selection input | A_candidates={len(discovery_a)} | "
+        f"B_candidates={len(discovery_b)} | support_retention=ON"
+    )
     selected_a, count_a, controlled_a = _holdout_select(
         "A", discovery_a, test_observation.states, selection_history,
-        discovery_engine, family_a, alpha=multiple_testing_alpha,
+        selection_engine, family_a, alpha=multiple_testing_alpha,
     )
     selected_b, count_b, controlled_b = _holdout_select(
         "B", discovery_b, test_observation.states, selection_history,
-        discovery_engine, family_b, alpha=multiple_testing_alpha,
+        selection_engine, family_b, alpha=multiple_testing_alpha,
     )
 
     ranking_a = _top_ranking([selected_a] if selected_a is not None else [])

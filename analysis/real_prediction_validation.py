@@ -26,6 +26,7 @@ PredictionTrend = str
 
 _LOGGER = logging.getLogger("trendanalysis.phase5.real_olap")
 
+
 def _configure_phase5_progress(enabled: bool) -> None:
     if not enabled:
         return
@@ -36,10 +37,10 @@ def _configure_phase5_progress(enabled: bool) -> None:
     _LOGGER.setLevel(logging.INFO)
     _LOGGER.propagate = False
 
+
 def _phase5_progress(enabled: bool, message: str, *args: Any) -> None:
     if enabled:
         _LOGGER.info(message, *args)
-
 
 
 @dataclass(frozen=True)
@@ -125,6 +126,10 @@ class Phase5RealOLAPValidationResult:
     selection_candidate_evaluations: int = 0
     selection_validated_predictions: int = 0
     multiple_testing_controlled_folds: int = 0
+    # Exact Phase 4 panel rows used by this Phase 5.8 run. Kept out of
+    # as_dict() because they can be large; the audit exporter consumes them
+    # directly to reconcile raw outcomes and preserve exact state atoms.
+    panel_observations: tuple[HistoricalRelationshipObservation, ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -153,6 +158,7 @@ class Phase5RealOLAPValidationResult:
             "selection_candidate_evaluations": self.selection_candidate_evaluations,
             "selection_validated_predictions": self.selection_validated_predictions,
             "multiple_testing_controlled_folds": self.multiple_testing_controlled_folds,
+            "panel_observation_count": len(self.panel_observations),
         }
 
 
@@ -275,17 +281,8 @@ def validate_real_olap_predictions(
     panel_builder: Callable[[RealOLAPValidationConfig], tuple[list[HistoricalRelationshipObservation], dict[str, Any], date | None]] | None = None,
     prediction_engine: PredictionEngine | None = None,
 ) -> Phase5RealOLAPValidationResult:
-    """Run Phase 5 predictions on the real Phase 4 OLAP state/outcome panel.
+    """Run Phase 5 predictions on the real Phase 4 OLAP state/outcome panel."""
 
-    Each prediction uses exactly one historical panel state as the current
-    condition and passes the *entire* panel to ``PredictionEngine``. Phase 5.7
-    then removes any observation whose state or forward outcome is not known by
-    that fold's prediction cutoff. The actual outcome for that fold is used
-    only after the prediction has been generated.
-
-    This is a Phase 5 diagnostic validation, not Phase 6 calibration or a
-    trading-performance claim.
-    """
     if panel_builder is None:
         from .real_olap_validation import build_real_olap_relationship_panel
         panel_builder = build_real_olap_relationship_panel
@@ -296,10 +293,6 @@ def validate_real_olap_predictions(
 
     _configure_phase5_progress(getattr(config, "progress_logging", True))
 
-    # Hardened Phase 5.8 must not select the strongest relationship directly
-    # from the same history used to estimate its apparent effect. Reuse the
-    # Phase 4.10 nested discovery -> inner-selection -> FDR gate, then build
-    # the Phase 5 probabilities from only the relationships that survived it.
     if prediction_engine is None and bool(getattr(config, "hardened_validation", True)):
         _phase5_progress(
             getattr(config, "progress_logging", True),
@@ -405,7 +398,7 @@ def validate_real_olap_predictions(
         method_b = _summary("B", folds, lambda fold: fold.method_b_trend)
         combined = _summary("COMBINED", folds, lambda fold: fold.predicted_trend)
         latest_fold = folds[-1] if folds else None
-        result = Phase5RealOLAPValidationResult(
+        return Phase5RealOLAPValidationResult(
             ticker=config.ticker, benchmark=config.benchmark,
             analysis_timeframe=config.analysis_timeframe,
             holding_period_months=config.holding_period_months,
@@ -415,7 +408,10 @@ def validate_real_olap_predictions(
             skipped_threshold_limited=skipped_threshold_limited,
             skipped_provenance_failed=skipped_provenance_failed,
             skipped_invalid_actual=skipped_invalid_actual,
-            prediction_folds=tuple(folds), method_a=method_a, method_b=method_b, combined=combined,
+            prediction_folds=tuple(folds),
+            method_a=method_a,
+            method_b=method_b,
+            combined=combined,
             baseline_majority_accuracy_pct=_majority_baseline_accuracy(folds),
             mean_combined_probabilities_pct=_mean_probabilities(folds),
             mean_combined_expected_return_pct=_mean_expected_return(folds),
@@ -427,8 +423,9 @@ def validate_real_olap_predictions(
             selection_candidate_evaluations=nested.selection_candidate_evaluations,
             selection_validated_predictions=nested.selection_validated_predictions,
             multiple_testing_controlled_folds=nested.multiple_testing_controlled_folds,
+            panel_observations=tuple(observations),
         )
-        return result
+
     if prediction_engine is None:
         progress_every_candidates = max(1, int(getattr(config, "relationship_progress_every_candidates", 500)))
 
@@ -533,7 +530,6 @@ def validate_real_olap_predictions(
             )
         )
 
-
         if fold_index == 1 or fold_index % max(1, getattr(config, "progress_every", 10)) == 0 or fold_index == candidate_predictions:
             _phase5_progress(
                 getattr(config, "progress_logging", True),
@@ -548,7 +544,6 @@ def validate_real_olap_predictions(
     method_a = _summary("A", folds, lambda fold: fold.method_a_trend)
     method_b = _summary("B", folds, lambda fold: fold.method_b_trend)
     combined = _summary("COMBINED", folds, lambda fold: fold.predicted_trend)
-
     latest_fold = folds[-1] if folds else None
     return Phase5RealOLAPValidationResult(
         ticker=config.ticker,
@@ -573,6 +568,7 @@ def validate_real_olap_predictions(
         latest_validated_prediction=latest_fold.as_dict() if latest_fold else None,
         latest_market_date=latest_market_date,
         phase4_surface_audit=panel_stats.get("state_surface_audit"),
+        panel_observations=tuple(observations),
     )
 
 
