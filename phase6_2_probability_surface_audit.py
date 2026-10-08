@@ -9,7 +9,7 @@ import numpy as np
 
 from analysis.phase5_snapshot import load_phase5_snapshot
 from analysis.outcome_labels import OUTCOME_CLASSES
-from analysis.phase6_calibration import calibrate_phase5_folds, CalibrationFold
+from analysis.phase6_calibration import calibrate_phase5_folds
 
 
 @dataclass(frozen=True)
@@ -139,16 +139,12 @@ def main() -> None:
         for label in OUTCOME_CLASSES
     }
 
-    calibration_folds = [
-        CalibrationFold(
-            prediction_date=row.prediction_date,
-            probabilities_pct=row.probabilities_pct,
-            actual_class=row.actual_class,
-        )
-        for row in rows
-    ]
+    # phase6_calibration.calibrate_phase5_folds() accepts any fold-like object
+    # exposing prediction_date, probabilities_pct, and actual_class. SnapshotFold
+    # already provides those fields, so constructing a second incompatible
+    # CalibrationFold abstraction is unnecessary and breaks against the actual API.
     calibrated = calibrate_phase5_folds(
-        calibration_folds,
+        rows,
         min_calibration_observations=args.min_calibration_observations,
     )
     calibrated_mean = {
