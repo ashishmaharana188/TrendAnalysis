@@ -1,8 +1,28 @@
+from __future__ import annotations
+
+import os
+import sys
 from datetime import date
+from pathlib import Path
+
+# Support both:
+#   py tests/test_real_olap_prediction.py
+# and:
+#   py -m tests.test_real_olap_prediction
+#
+# When a test file is executed directly, Python starts sys.path from tests\,
+# so the repository root containing analysis\ is otherwise not importable.
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from analysis.historical_fold_audit import (
     audit_prediction_fold,
     print_historical_fold_audit,
+)
+from analysis.phase5_snapshot import (
+    default_snapshot_path,
+    export_phase5_snapshot,
 )
 from analysis.real_olap_validation import RealOLAPValidationConfig
 from analysis.real_prediction_validation import (
@@ -39,11 +59,12 @@ def main() -> None:
     assert result.latest_market_date is not None
     assert result.skipped_provenance_failed == 0
 
-    # 24-Aug-2026 remains a useful historical-state diagnostic, but it is not
-    # assumed to be a trade entry. In particular, a sideways observed trend
-    # must never become a trade merely because the model predicts UP/DOWN.
     aug24 = next(
-        (fold for fold in result.prediction_folds if fold.prediction_date == date(2026, 8, 24)),
+        (
+            fold
+            for fold in result.prediction_folds
+            if fold.prediction_date == date(2026, 8, 24)
+        ),
         None,
     )
     if aug24 is not None:
@@ -52,8 +73,9 @@ def main() -> None:
             assert not aug24.trade_eligible
             assert aug24.trade_reason == "SIDEWAYS_CURRENT_TREND"
 
-    # Audit the latest genuinely trade-eligible historical fold, if one exists.
-    eligible_folds = [fold for fold in result.prediction_folds if fold.trade_eligible]
+    eligible_folds = [
+        fold for fold in result.prediction_folds if fold.trade_eligible
+    ]
     if eligible_folds:
         audit_date = eligible_folds[-1].prediction_date
         audit = audit_prediction_fold(config, audit_date, result)
@@ -66,7 +88,42 @@ def main() -> None:
         assert audit.one_month_window
         assert audit.return_reconciled
     else:
-        print("PHASE 5.8 TRADE GATE: no historically trade-eligible folds were found.")
+        print(
+            "PHASE 5.8 TRADE GATE: no historically trade-eligible folds were found."
+        )
+
+    # ------------------------------------------------------------------
+    # FROZEN DEVELOPMENT SNAPSHOT
+    #
+    # This is intentionally performed only after all Phase 5.8 assertions
+    # succeed. The resulting snapshot becomes the input fixture for Phase 6+
+    # and avoids repeating the expensive OLAP walk-forward run for every
+    # downstream calibration/policy code change.
+    # ------------------------------------------------------------------
+    snapshot_root = os.getenv(
+        "PHASE5_SNAPSHOT_ROOT",
+        "artifacts/phase5_8",
+    )
+    snapshot_version = os.getenv(
+        "PHASE5_SNAPSHOT_VERSION",
+        "v1",
+    )
+    snapshot_path = default_snapshot_path(
+        config,
+        root=snapshot_root,
+        version=snapshot_version,
+    )
+
+    exported = export_phase5_snapshot(
+        result,
+        config,
+        snapshot_path,
+        repository_root=os.getcwd(),
+    )
+
+    print(f"PHASE 5.8 FROZEN SNAPSHOT: {exported}")
+    print("Snapshot status: FROZEN")
+    print("Phase 6+ development can consume this snapshot without OLAP recomputation.")
 
     print("PHASE 5.8 REAL OLAP PREDICTION VALIDATION: PASS")
     print("PHASE 5.8 TRADE GATE VALIDATION: PASS")
@@ -75,3 +132,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
