@@ -1058,10 +1058,13 @@ def build_real_olap_relationship_panel(
         raise RuntimeError(
             f"No real OLAP benchmark history found for {config.benchmark!r}."
         )
+        
+    industry, sector, industry_constituents, sector_constituents = _current_membership(
+    config.ticker
+)
 
     # Keep the target's structural group labels stable; constituent lists are
     # refreshed point-in-time inside the historical snapshot loop.
-    industry, sector, _, _ = _current_membership(config.ticker, None)
 
     _configure_progress_logging(config.progress_logging)
     run_start = time.perf_counter()
