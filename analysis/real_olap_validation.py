@@ -718,7 +718,10 @@ def _prediction_dates(
     return stepped[-max_folds:]
 
 
-def _current_membership(ticker: str) -> tuple[str | None, str | None, list[str], list[str]]:
+def _current_membership(
+    ticker: str,
+    as_of_date: date | None = None,
+) -> tuple[str | None, str | None, list[str], list[str]]:
     from data_access.metadata import (
         get_companies_by_industry,
         get_companies_by_sector,
@@ -734,13 +737,13 @@ def _current_membership(ticker: str) -> tuple[str | None, str | None, list[str],
 
     industry_constituents = [
         str(row.get("Ticker"))
-        for row in get_companies_by_industry(industry)
+        for row in get_companies_by_industry(industry, as_of_date=as_of_date)
         if row.get("Ticker")
     ] if industry else []
 
     sector_constituents = [
         str(row.get("Ticker"))
-        for row in get_companies_by_sector(sector)
+        for row in get_companies_by_sector(sector, as_of_date=as_of_date)
         if row.get("Ticker")
     ] if sector else []
 
@@ -1056,7 +1059,9 @@ def build_real_olap_relationship_panel(
             f"No real OLAP benchmark history found for {config.benchmark!r}."
         )
 
-    industry, sector, industry_constituents, sector_constituents = _current_membership(config.ticker)
+    # Keep the target's structural group labels stable; constituent lists are
+    # refreshed point-in-time inside the historical snapshot loop.
+    industry, sector, _, _ = _current_membership(config.ticker, None)
 
     _configure_progress_logging(config.progress_logging)
     run_start = time.perf_counter()
@@ -1168,6 +1173,9 @@ def build_real_olap_relationship_panel(
                 days=-max(1, round(timeframe_months * 30.4375))
             )
 
+            _, _, industry_constituents_as_of, sector_constituents_as_of = _current_membership(
+                config.ticker, prediction_date
+            )
             states, limitations, timing_limited = _build_complete_state_atoms(
                 ticker=config.ticker,
                 benchmark=config.benchmark,
@@ -1179,8 +1187,8 @@ def build_real_olap_relationship_panel(
                 global_histories=global_histories,
                 industry=industry,
                 sector=sector,
-                industry_constituents=industry_constituents,
-                sector_constituents=sector_constituents,
+                industry_constituents=industry_constituents_as_of,
+                sector_constituents=sector_constituents_as_of,
                 institutional_rows=institutional_rows,
                 options_rows=options_rows,
                 basis_rows=basis_rows,

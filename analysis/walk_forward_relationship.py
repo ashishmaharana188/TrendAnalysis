@@ -6,9 +6,10 @@ from typing import Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 
+import numpy as np
+
 from .hardening_4_10 import (
     audit_parameter_manifest,
-    search_adjusted_permutation_p_values,
     TestingFamily,
 )
 
@@ -19,6 +20,13 @@ from .relationship import (
     RelationshipResult,
 )
 from .relationship_graph import candidate_feature_sets
+from .relationship_fastpath import (
+    method_a_prepared,
+    method_b_prepared,
+    prepare_relationship_context,
+    materialize_selected_support,
+)
+from .fast_permutation import search_adjusted_permutation_p_values_matrix
 
 
 @dataclass(frozen=True)
@@ -400,6 +408,7 @@ def _discover_all_candidate_relationships(
         total_candidates = len(candidates)
         processed_total = 0
         progress = engine.progress_callback
+        prepared_context = prepare_relationship_context(current_states, history)
         if progress is not None:
             progress(
                 f"Nested discovery start | features={len(current_states)} | "
@@ -431,11 +440,11 @@ def _discover_all_candidate_relationships(
                 # for the inner holdout. Their support is recomputed there.
                 retain_supporting_data=False,
             )
-            results_a = candidate_engine.method_a_similar_states(
-                current_states, history, candidate_sets=order_candidates
+            results_a = method_a_prepared(
+                candidate_engine, current_states, history, order_candidates, prepared_context
             )
-            results_b = candidate_engine.method_b_conditioned_distribution(
-                current_states, history, candidate_sets=order_candidates
+            results_b = method_b_prepared(
+                candidate_engine, current_states, history, order_candidates, prepared_context
             )
             for result in (*results_a, *results_b):
                 key = (result.method, tuple(sorted(result.variables)))
@@ -482,6 +491,7 @@ def _holdout_select(
     family: TestingFamily,
     *,
     alpha: float,
+    prepared_context=None,
 ) -> tuple[object | None, int, bool]:
     """
     Select a discovered relationship on a chronological inner holdout.
@@ -523,63 +533,31 @@ def _holdout_select(
     candidate_variables = [tuple(candidate.variables) for candidate in discovery_results]
     evaluated_results: list[RelationshipResult] = []
     if candidate_variables:
+        if prepared_context is None:
+            prepared_context = prepare_relationship_context(current_states, selection_history)
         evaluated_results = (
-            engine.method_a_similar_states(
-                current_states,
-                selection_history,
-                candidate_sets=candidate_variables,
+            method_a_prepared(
+                engine, current_states, selection_history, candidate_variables, prepared_context,
+                compact_support=True,
             )
             if method == "A"
-            else engine.method_b_conditioned_distribution(
-                current_states,
-                selection_history,
-                candidate_sets=candidate_variables,
+            else method_b_prepared(
+                engine, current_states, selection_history, candidate_variables, prepared_context,
+                compact_support=True,
             )
         )
 
-    by_variables = {tuple(sorted(item.variables)): item for item in evaluated_results}
-
-    supportful_results = [
-        item
-        for item in evaluated_results
-        if bool(getattr(item, "supporting_observations", ()))
-        and bool(getattr(item, "supporting_weights", ()))
-    ]
-
-    evaluations = [
-        by_variables[tuple(sorted(candidate.variables))]
-        for candidate in discovery_results
-        if tuple(sorted(candidate.variables)) in by_variables
-        and bool(
-            getattr(
-                by_variables[tuple(sorted(candidate.variables))],
-                "supporting_observations",
-                (),
-            )
-        )
-        and bool(
-            getattr(
-                by_variables[tuple(sorted(candidate.variables))],
-                "supporting_weights",
-                (),
-            )
-        )
-    ]
+    # Prepared evaluation preserves the discovery candidate ordering. Invalid
+    # candidates simply produce no RelationshipResult and therefore no support row;
+    # the compact result list and support matrix remain aligned one-to-one.
+    evaluations = list(evaluated_results)
 
     if progress is not None:
         progress(
             f"Nested selection {method} progress "
             f"{total_candidates}/{total_candidates} | "
             f"re_evaluated={len(evaluated_results)} | "
-            f"supportful={len(supportful_results)} | "
-            f"evaluations={len(evaluations)}"
-        )
-
-    if evaluated_results and not evaluations:
-        raise RuntimeError(
-            "Nested selection produced re-evaluated relationships but none "
-            "contained usable supporting observations/weights. "
-            "This indicates a support-retention or candidate-evaluation wiring error."
+            f"support_mode=COMPACT | evaluations={len(evaluations)}"
         )
 
     if not evaluations:
@@ -587,34 +565,24 @@ def _holdout_select(
             progress(f"Nested selection {method} complete | evaluations=0 | accepted=0")
         return None, 0, False
 
+    compact_support = getattr(evaluated_results, "support_matrix", None)
+    if compact_support is None or len(compact_support) != len(evaluations):
+        raise RuntimeError("Compact selection support/result alignment is invalid")
+
     if progress is not None:
         progress(
             f"Nested selection {method} search-adjusted gate start | "
-            f"evaluations={len(evaluations)} | permutations=199 | alpha={alpha:.3f}"
+            f"evaluations={len(evaluations)} | permutations=199 | alpha={alpha:.3f} | support=COMPACT"
         )
 
-    permutation = search_adjusted_permutation_p_values(
-        [
-            (result.supporting_observations, result.supporting_weights)
-            for result in evaluations
-        ],
+    permutation = search_adjusted_permutation_p_values_matrix(
+        compact_support,
+        np.asarray([float(item.stock_return_pct) for item in selection_history], dtype=np.float64),
         baseline_mean,
-        family_id=family.family_id,
-        universe_observations=[
-            (item.as_of_date, float(item.stock_return_pct))
-            for item in selection_history
-        ],
         permutations=199,
         seed=sum(ord(ch) for ch in family.family_id) + len(selection_history),
-        compute_raw_p_values=False,
     )
-    # ``max_statistic_p_values`` are already search-adjusted: for each
-    # candidate the p-value asks how often the *maximum* null statistic across
-    # the entire candidate family is at least as extreme as that candidate's
-    # observed statistic. They therefore control the family-wise search error
-    # directly and must be thresholded as adjusted p-values. Running BH on
-    # these values again is redundant double correction.
-    adjusted = tuple(float(value) for value in permutation.max_statistic_p_values)
+    adjusted = tuple(float(value) for value in permutation)
     accepted = tuple(
         index
         for index, p_value in enumerate(adjusted)
@@ -647,6 +615,10 @@ def _holdout_select(
             -abs(float(row[0].score)),
             -float(row[0].reliability),
         ),
+    )
+    selected_index = evaluations.index(selected)
+    selected = materialize_selected_support(
+        selected, current_states, prepared_context, compact_support[selected_index]
     )
     if progress is not None:
         progress(
@@ -774,13 +746,20 @@ def _run_hardened_fold(
         f"selection input | A_candidates={len(discovery_a)} | "
         f"B_candidates={len(discovery_b)} | support_retention=ON"
     )
+    selection_context = (
+        prepare_relationship_context(test_observation.states, selection_history)
+        if (discovery_a or discovery_b) and selection_history
+        else None
+    )
     selected_a, count_a, controlled_a = _holdout_select(
         "A", discovery_a, test_observation.states, selection_history,
         selection_engine, family_a, alpha=multiple_testing_alpha,
+        prepared_context=selection_context,
     )
     selected_b, count_b, controlled_b = _holdout_select(
         "B", discovery_b, test_observation.states, selection_history,
         selection_engine, family_b, alpha=multiple_testing_alpha,
+        prepared_context=selection_context,
     )
 
     ranking_a = _top_ranking([selected_a] if selected_a is not None else [])

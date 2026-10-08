@@ -1,3 +1,4 @@
+from datetime import date, datetime
 from typing import Any
 from .db import get_connection
 from .ticker import normalize_ticker
@@ -90,6 +91,7 @@ def get_company(ticker: str):
 def get_companies_by_sector(
     sector: str,
     active_only: bool = True,
+    as_of_date: str | date | datetime | None = None,
 ) -> list[dict[str, Any]]:
     """
     Return companies belonging to a sector.
@@ -115,6 +117,10 @@ def get_companies_by_sector(
     if active_only:
         sql += " AND IsActive = TRUE"
 
+    if as_of_date is not None:
+        sql += " AND (valid_data_since IS NULL OR valid_data_since <= ?)"
+        params.append(as_of_date)
+
     sql += " ORDER BY Ticker"
 
     with get_connection() as conn:
@@ -139,6 +145,7 @@ def get_companies_by_sector(
 def get_companies_by_industry(
     industry: str,
     active_only: bool = True,
+    as_of_date: str | date | datetime | None = None,
 ) -> list[dict[str, Any]]:
     """
     Return companies belonging to an industry.
@@ -163,6 +170,10 @@ def get_companies_by_industry(
 
     if active_only:
         sql += "AND IsActive = TRUE"
+
+    if as_of_date is not None:
+        sql += " AND (valid_data_since IS NULL OR valid_data_since <= ?)"
+        params.append(as_of_date)
 
     sql += " ORDER BY Ticker"
 

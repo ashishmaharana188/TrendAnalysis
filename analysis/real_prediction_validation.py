@@ -46,6 +46,7 @@ def _phase5_progress(enabled: bool, message: str, *args: Any) -> None:
 @dataclass(frozen=True)
 class PredictionFoldResult:
     prediction_date: date
+    observed_trend: PredictionTrend
     actual_return_pct: float
     actual_class: OutcomeClass | None
     predicted_trend: PredictionTrend
@@ -60,10 +61,13 @@ class PredictionFoldResult:
     limited: bool
     provenance_clean: bool
     hit: bool | None
+    trade_eligible: bool
+    trade_reason: str
 
     def as_dict(self) -> dict[str, Any]:
         return {
             "prediction_date": self.prediction_date,
+            "observed_trend": self.observed_trend,
             "actual_return_pct": self.actual_return_pct,
             "actual_class": self.actual_class,
             "predicted_trend": self.predicted_trend,
@@ -78,6 +82,8 @@ class PredictionFoldResult:
             "limited": self.limited,
             "provenance_clean": self.provenance_clean,
             "hit": self.hit,
+            "trade_eligible": self.trade_eligible,
+            "trade_reason": self.trade_reason,
         }
 
 
@@ -85,6 +91,10 @@ class PredictionFoldResult:
 class PredictionMethodSummary:
     method: str
     evaluated_predictions: int
+    current_directional_opportunities: int
+    trade_eligible_predictions: int
+    trade_hits: int
+    trade_hit_rate_pct: float
     directional_predictions: int
     directional_hits: int
     directional_hit_rate_pct: float
@@ -180,6 +190,33 @@ def _label_direction(trend: str | None) -> bool:
     return trend in {"UP", "DOWN"}
 
 
+def _observed_company_trend(states: dict[str, Any]) -> PredictionTrend:
+    """Map the point-in-time Phase 3 company price direction to UP/DOWN/SIDEWAYS."""
+    raw = states.get("company.market.price")
+    if not isinstance(raw, str):
+        return "NO_CLEAR_TREND"
+    direction = raw.split("/", 1)[0].strip().lower()
+    return {
+        "rising": "UP",
+        "falling": "DOWN",
+        "stable": "SIDEWAYS",
+    }.get(direction, "NO_CLEAR_TREND")
+
+
+def _trade_gate(
+    observed_trend: PredictionTrend,
+    predicted_trend: PredictionTrend,
+) -> tuple[bool, str]:
+    """A trade requires a directional current state and model agreement."""
+    if observed_trend == "SIDEWAYS":
+        return False, "SIDEWAYS_CURRENT_TREND"
+    if observed_trend not in {"UP", "DOWN"}:
+        return False, "CURRENT_TREND_UNAVAILABLE"
+    if predicted_trend != observed_trend:
+        return False, "MODEL_CONFLICT"
+    return True, "DIRECTIONAL_AGREEMENT"
+
+
 def _directional_hit(predicted: str | None, actual: OutcomeClass | None) -> bool | None:
     if predicted not in {"UP", "DOWN"} or actual is None:
         return None
@@ -192,6 +229,15 @@ def _summary(
     trend_getter: Callable[[PredictionFoldResult], str | None],
 ) -> PredictionMethodSummary:
     usable = [fold for fold in folds if not fold.limited and fold.provenance_clean]
+    current_directional = [fold for fold in usable if _label_direction(fold.observed_trend)]
+    trade_eligible = [
+        fold for fold in usable
+        if _trade_gate(fold.observed_trend, trend_getter(fold))[0]
+    ]
+    trade_hits = [
+        fold for fold in trade_eligible
+        if fold.actual_class == fold.observed_trend
+    ]
     directional = [fold for fold in usable if _label_direction(trend_getter(fold))]
     directional_hits = [fold for fold in directional if _directional_hit(trend_getter(fold), fold.actual_class) is True]
     clear = [fold for fold in usable if trend_getter(fold) in {"UP", "SIDEWAYS", "DOWN"}]
@@ -202,6 +248,10 @@ def _summary(
     return PredictionMethodSummary(
         method=method,
         evaluated_predictions=len(usable),
+        current_directional_opportunities=len(current_directional),
+        trade_eligible_predictions=len(trade_eligible),
+        trade_hits=len(trade_hits),
+        trade_hit_rate_pct=_percent(len(trade_hits), len(trade_eligible)),
         directional_predictions=len(directional),
         directional_hits=len(directional_hits),
         directional_hit_rate_pct=_percent(len(directional_hits), len(directional)),
@@ -358,6 +408,8 @@ def validate_real_olap_predictions(
                 validation_evidence=None,
                 selected_relationships={"A": ranking_a, "B": ranking_b},
             )
+            observed_trend = _observed_company_trend(dict(observation.states))
+            trade_eligible, trade_reason = _trade_gate(observed_trend, result.trend)
             thresholds = result.outcome_thresholds
             if thresholds.limited:
                 skipped_threshold_limited += 1
@@ -377,6 +429,7 @@ def validate_real_olap_predictions(
             folds.append(
                 PredictionFoldResult(
                     prediction_date=cutoff,
+                    observed_trend=observed_trend,
                     actual_return_pct=actual_numeric,
                     actual_class=actual_class,
                     predicted_trend=result.trend,
@@ -391,6 +444,8 @@ def validate_real_olap_predictions(
                     limited=result.limited,
                     provenance_clean=provenance_clean,
                     hit=hit,
+                    trade_eligible=trade_eligible,
+                    trade_reason=trade_reason,
                 )
             )
 
@@ -495,6 +550,8 @@ def validate_real_olap_predictions(
             validation_evidence=None,
         )
 
+        observed_trend = _observed_company_trend(dict(observation.states))
+        trade_eligible, trade_reason = _trade_gate(observed_trend, result.trend)
         _assert_fold_temporal_safety(result, cutoff, observations)
         thresholds = result.outcome_thresholds
         if thresholds.limited:
@@ -513,6 +570,7 @@ def validate_real_olap_predictions(
         folds.append(
             PredictionFoldResult(
                 prediction_date=cutoff,
+                observed_trend=observed_trend,
                 actual_return_pct=actual_numeric,
                 actual_class=actual_class,
                 predicted_trend=result.trend,
@@ -527,6 +585,8 @@ def validate_real_olap_predictions(
                 limited=result.limited,
                 provenance_clean=provenance_clean,
                 hit=hit,
+                trade_eligible=trade_eligible,
+                trade_reason=trade_reason,
             )
         )
 
@@ -587,6 +647,10 @@ def print_real_olap_prediction_report(result: Phase5RealOLAPValidationResult) ->
     print()
     for summary in (result.method_a, result.method_b, result.combined):
         print(f"Method {summary.method}:")
+        print("  current directional opportunities:", summary.current_directional_opportunities)
+        print("  trade-eligible predictions:", summary.trade_eligible_predictions)
+        print("  trade hits:", summary.trade_hits)
+        print("  trade hit rate:", round(summary.trade_hit_rate_pct, 2))
         print("  directional predictions:", summary.directional_predictions)
         print("  directional hits:", summary.directional_hits)
         print("  directional hit rate:", round(summary.directional_hit_rate_pct, 2))
