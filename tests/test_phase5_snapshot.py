@@ -119,7 +119,7 @@ def main() -> None:
                 },
             )()
         )
-        assert path.name == "RELIANCE_Nifty_50_6M_1M_v1"
+        assert path.name == "RELIANCE_Nifty_50_6M_1M_v2"
 
     print("PHASE 5 SNAPSHOT TEST: PASS")
     print("Manifest validation: PASS")

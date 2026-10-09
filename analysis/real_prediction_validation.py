@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from math import isfinite, log
 from typing import Any, Callable, Iterable, Sequence
@@ -63,6 +63,8 @@ class PredictionFoldResult:
     hit: bool | None
     trade_eligible: bool
     trade_reason: str
+    method_a_probabilities_pct: dict[OutcomeClass, float] = field(default_factory=dict)
+    method_b_probabilities_pct: dict[OutcomeClass, float] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -78,6 +80,8 @@ class PredictionFoldResult:
             "training_observations": self.training_observations,
             "method_a_trend": self.method_a_trend,
             "method_b_trend": self.method_b_trend,
+            "method_a_probabilities_pct": dict(self.method_a_probabilities_pct),
+            "method_b_probabilities_pct": dict(self.method_b_probabilities_pct),
             "method_agreement": self.method_agreement,
             "limited": self.limited,
             "provenance_clean": self.provenance_clean,
@@ -440,6 +444,12 @@ def validate_real_olap_predictions(
                     training_observations=result.training_observations,
                     method_a_trend=result.method_a.trend if result.method_a else None,
                     method_b_trend=result.method_b.trend if result.method_b else None,
+                    method_a_probabilities_pct=(
+                        dict(result.method_a.probabilities_pct) if result.method_a else {}
+                    ),
+                    method_b_probabilities_pct=(
+                        dict(result.method_b.probabilities_pct) if result.method_b else {}
+                    ),
                     method_agreement=result.method_agreement,
                     limited=result.limited,
                     provenance_clean=provenance_clean,
@@ -581,6 +591,12 @@ def validate_real_olap_predictions(
                 training_observations=result.training_observations,
                 method_a_trend=result.method_a.trend if result.method_a else None,
                 method_b_trend=result.method_b.trend if result.method_b else None,
+                method_a_probabilities_pct=(
+                    dict(result.method_a.probabilities_pct) if result.method_a else {}
+                ),
+                method_b_probabilities_pct=(
+                    dict(result.method_b.probabilities_pct) if result.method_b else {}
+                ),
                 method_agreement=result.method_agreement,
                 limited=result.limited,
                 provenance_clean=provenance_clean,

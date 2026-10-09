@@ -176,7 +176,7 @@ def main() -> None:
         assert loaded2.market_daily["instrument"].to_pylist() == ["Nifty_50", "RELIANCE"]
 
         assert default_snapshot_path(config).name == (
-            "RELIANCE_Nifty_50_6M_1M_v1"
+            "RELIANCE_Nifty_50_6M_1M_v2"
         )
 
     print("PHASE 5.8 SNAPSHOT EXPORT PREFLIGHT: PASS")

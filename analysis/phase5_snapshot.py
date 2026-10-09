@@ -16,7 +16,8 @@ import pyarrow.parquet as pq
 from .outcome_labels import OUTCOME_CLASSES
 
 
-SNAPSHOT_SCHEMA_VERSION = "1"
+SNAPSHOT_SCHEMA_VERSION = "2"
+SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS = frozenset({"1", SNAPSHOT_SCHEMA_VERSION})
 PHASE5_BASELINE_VERSION = "5.8"
 REQUIRED_PHASE5_SOURCES = (
     "analysis/relationship.py",
@@ -439,7 +440,7 @@ def load_phase5_snapshot(
 
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
-    if manifest.get("schema_version") != SNAPSHOT_SCHEMA_VERSION:
+    if manifest.get("schema_version") not in SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS:
         raise ValueError(
             f"Unsupported snapshot schema: {manifest.get('schema_version')!r}"
         )
@@ -502,7 +503,7 @@ def default_snapshot_path(
     config: Any,
     *,
     root: str | Path = "artifacts/phase5_8",
-    version: str = "v1",
+    version: str = "v2",
 ) -> Path:
     safe_ticker = str(config.ticker).replace("/", "_")
     safe_benchmark = str(config.benchmark).replace("/", "_")
