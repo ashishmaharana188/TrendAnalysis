@@ -59,6 +59,28 @@ class FakeFold:
     probabilities_pct: dict[str, float]
 
     def as_dict(self):
+        method_a = {
+            "probabilities_pct": {"UP": 67.0, "SIDEWAYS": 21.0, "DOWN": 12.0},
+            "evidence_score": 1.2,
+            "effective_sample_size": 18.0,
+            "sample_count": 20,
+            "variables": ["company.market.price", "macro.Brent_Crude"],
+            "condition": ["company.market.price=Rising", "macro.Brent_Crude=High"],
+            "limited": False,
+            "limitations": [],
+        }
+        method_b = {
+            "probabilities_pct": {"UP": 14.0, "SIDEWAYS": 26.0, "DOWN": 60.0},
+            "evidence_score": -0.7,
+            "effective_sample_size": 11.0,
+            "sample_count": 14,
+            "variables": ["industry.market", "macro.Brent_Crude"],
+            "condition": ["industry.market=Stable", "macro.Brent_Crude=High"],
+            "limited": False,
+            "limitations": [],
+        }
+        selection_a = {"method": "A", "selection_source": "test_fixture", "selection_status": "SELECTED", "selected_after_selection_gate": True, "selected_relationship": None, "ranking": None, "prediction_method_output": method_a, "gate_metadata": {"candidate_evaluation_count": 10}}
+        selection_b = {"method": "B", "selection_source": "test_fixture", "selection_status": "SELECTED", "selected_after_selection_gate": True, "selected_relationship": None, "ranking": None, "prediction_method_output": method_b, "gate_metadata": {"candidate_evaluation_count": 12}}
         return {
             "prediction_date": self.prediction_date.isoformat(),
             "actual_return_pct": self.actual_return_pct,
@@ -66,6 +88,21 @@ class FakeFold:
             "predicted_trend": self.predicted_trend,
             "observed_trend": self.observed_trend,
             "probabilities_pct": self.probabilities_pct,
+            "method_a_probabilities_pct": method_a["probabilities_pct"],
+            "method_b_probabilities_pct": method_b["probabilities_pct"],
+            "method_a_output": method_a,
+            "method_b_output": method_b,
+            "method_a_selection_metadata": selection_a,
+            "method_b_selection_metadata": selection_b,
+            "selection_metadata": {"recording_contract_version": 1, "selection_mode": "test_fixture", "method_a": selection_a, "method_b": selection_b, "nested_selection_fold": None, "nested_run_summary": {}},
+            "outcome_thresholds": {"limited": False, "up_threshold_pct": 1.0, "down_threshold_pct": -1.0},
+            "prediction_provenance": {"clean": True},
+            "prediction_result": {"trend": self.predicted_trend, "probabilities_pct": self.probabilities_pct},
+            "current_states": {"company.market.price": "Rising / High"},
+            "benchmark_return_pct": 0.5,
+            "relative_return_pct": 1.0,
+            "outcome_end_date": "2026-09-24",
+            "fold_recording_contract_version": 1,
         }
 
 
@@ -88,6 +125,7 @@ class FakeResult:
             "evaluated_predictions": self.evaluated_predictions,
             "latest_validated_prediction_date": self.latest_validated_prediction_date,
             "latest_market_date": self.latest_market_date,
+            "prediction_folds": [{"duplicate_payload": "must stay out of the summary"}],
         }
 
 
@@ -161,6 +199,10 @@ def main() -> None:
         )
         loaded = load_phase5_snapshot(exported)
         assert loaded.market_daily.num_rows == 1
+        summary = json.loads((exported / "phase5_result_summary.json").read_text(encoding="utf-8"))
+        assert "prediction_folds" not in summary
+        assert summary["prediction_fold_count"] == 1
+        assert summary["prediction_folds_artifact"] == "prediction_folds.jsonl.gz"
 
         destination2 = base / "nonempty-benchmark"
         exported2 = export_phase5_snapshot(
@@ -176,7 +218,7 @@ def main() -> None:
         assert loaded2.market_daily["instrument"].to_pylist() == ["Nifty_50", "RELIANCE"]
 
         assert default_snapshot_path(config).name == (
-            "RELIANCE_Nifty_50_6M_1M_v2"
+            "RELIANCE_Nifty_50_6M_1M"
         )
 
     print("PHASE 5.8 SNAPSHOT EXPORT PREFLIGHT: PASS")

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Iterable
+from typing import Any, Iterable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 
@@ -56,6 +56,8 @@ class WalkForwardFold:
     # discovery -> selection -> FDR gate. These are never outer-test data.
     selected_a_result: RelationshipResult | None = None
     selected_b_result: RelationshipResult | None = None
+    method_a_selection_metadata: dict[str, Any] | None = None
+    method_b_selection_metadata: dict[str, Any] | None = None
 
     def as_dict(self) -> dict:
         return {
@@ -67,6 +69,8 @@ class WalkForwardFold:
             "combined": self.combined,
             "selected_a_result": self.selected_a_result.as_dict() if self.selected_a_result else None,
             "selected_b_result": self.selected_b_result.as_dict() if self.selected_b_result else None,
+            "method_a_selection_metadata": self.method_a_selection_metadata,
+            "method_b_selection_metadata": self.method_b_selection_metadata,
         }
 
 
@@ -492,7 +496,7 @@ def _holdout_select(
     *,
     alpha: float,
     prepared_context=None,
-) -> tuple[object | None, int, bool]:
+) -> tuple[object | None, int, bool, dict[str, Any]]:
     """
     Select a discovered relationship on a chronological inner holdout.
 
@@ -506,8 +510,53 @@ def _holdout_select(
     pass when the exhaustive universe contains hundreds of thousands of
     candidates.
     """
+    configured_permutations = 199
+    selection_seed = sum(ord(ch) for ch in family.family_id) + len(selection_history)
+
+    def audit_record(
+        status: str,
+        *,
+        evaluated_count: int = 0,
+        adjusted_p_values: tuple[float, ...] = (),
+        accepted_count: int = 0,
+        selected_relationship: object | None = None,
+        selected_index: int | None = None,
+        selected_adjusted_p_value: float | None = None,
+        permutations_run: bool = False,
+    ) -> dict[str, Any]:
+        return {
+            "method": method,
+            "selection_status": status,
+            "discovery_candidate_count": len(discovery_results),
+            "selection_history_count": len(selection_history),
+            "candidate_evaluation_count": evaluated_count,
+            "multiple_testing": {
+                "procedure": "search_adjusted_max_statistic_permutation",
+                "permutations_configured": configured_permutations,
+                "permutations_run": configured_permutations if permutations_run else 0,
+                "alpha": float(alpha),
+                "seed": selection_seed,
+                "minimum_adjusted_p_value": min(adjusted_p_values) if adjusted_p_values else None,
+                "median_adjusted_p_value": float(np.median(adjusted_p_values)) if adjusted_p_values else None,
+                "maximum_adjusted_p_value": max(adjusted_p_values) if adjusted_p_values else None,
+                "accepted_candidate_count": accepted_count,
+                "selected_adjusted_p_value": selected_adjusted_p_value,
+                "selected_evaluated_candidate_index": selected_index,
+            },
+            "selected_relationship": (
+                selected_relationship.as_dict()
+                if selected_relationship is not None and hasattr(selected_relationship, "as_dict")
+                else None
+            ),
+        }
+
     if not discovery_results or not selection_history:
-        return None, 0, False
+        return (
+            None,
+            0,
+            False,
+            audit_record("NOT_RUN_EMPTY_DISCOVERY_OR_SELECTION_HISTORY"),
+        )
 
     if not engine.retain_supporting_data:
         raise RuntimeError(
@@ -563,7 +612,12 @@ def _holdout_select(
     if not evaluations:
         if progress is not None:
             progress(f"Nested selection {method} complete | evaluations=0 | accepted=0")
-        return None, 0, False
+        return (
+            None,
+            0,
+            False,
+            audit_record("NOT_RUN_NO_VALID_CANDIDATE_EVALUATIONS"),
+        )
 
     compact_support = getattr(evaluated_results, "support_matrix", None)
     if compact_support is None or len(compact_support) != len(evaluations):
@@ -579,8 +633,8 @@ def _holdout_select(
         compact_support,
         np.asarray([float(item.stock_return_pct) for item in selection_history], dtype=np.float64),
         baseline_mean,
-        permutations=199,
-        seed=sum(ord(ch) for ch in family.family_id) + len(selection_history),
+        permutations=configured_permutations,
+        seed=selection_seed,
     )
     adjusted = tuple(float(value) for value in permutation)
     accepted = tuple(
@@ -595,7 +649,18 @@ def _holdout_select(
                 f"evaluations={len(evaluations)} | accepted=0 | "
                 f"min_adjusted_p={min(adjusted):.6f}"
             )
-        return None, len(evaluations), True
+        return (
+            None,
+            len(evaluations),
+            True,
+            audit_record(
+                "REJECTED_NO_CANDIDATE_PASSED_ADJUSTED_P_THRESHOLD",
+                evaluated_count=len(evaluations),
+                adjusted_p_values=adjusted,
+                accepted_count=0,
+                permutations_run=True,
+            ),
+        )
 
     if progress is not None:
         progress(
@@ -617,6 +682,7 @@ def _holdout_select(
         ),
     )
     selected_index = evaluations.index(selected)
+    selected_adjusted_p_value = float(_q)
     selected = materialize_selected_support(
         selected, current_states, prepared_context, compact_support[selected_index]
     )
@@ -626,7 +692,21 @@ def _holdout_select(
             f"accepted={len(accepted)} | selected_order={len(selected.variables)} | "
             f"selected_adjusted_p={_q:.6f}"
         )
-    return selected, len(evaluations), True
+    return (
+        selected,
+        len(evaluations),
+        True,
+        audit_record(
+            "SELECTED_AFTER_ADJUSTED_P_THRESHOLD",
+            evaluated_count=len(evaluations),
+            adjusted_p_values=adjusted,
+            accepted_count=len(accepted),
+            selected_relationship=selected,
+            selected_index=selected_index,
+            selected_adjusted_p_value=selected_adjusted_p_value,
+            permutations_run=True,
+        ),
+    )
 
 
 def _run_hardened_fold(
@@ -751,12 +831,12 @@ def _run_hardened_fold(
         if (discovery_a or discovery_b) and selection_history
         else None
     )
-    selected_a, count_a, controlled_a = _holdout_select(
+    selected_a, count_a, controlled_a, selection_metadata_a = _holdout_select(
         "A", discovery_a, test_observation.states, selection_history,
         selection_engine, family_a, alpha=multiple_testing_alpha,
         prepared_context=selection_context,
     )
-    selected_b, count_b, controlled_b = _holdout_select(
+    selected_b, count_b, controlled_b, selection_metadata_b = _holdout_select(
         "B", discovery_b, test_observation.states, selection_history,
         selection_engine, family_b, alpha=multiple_testing_alpha,
         prepared_context=selection_context,
@@ -790,6 +870,8 @@ def _run_hardened_fold(
             combined=row_combined,
             selected_a_result=selected_a,
             selected_b_result=selected_b,
+            method_a_selection_metadata=selection_metadata_a,
+            method_b_selection_metadata=selection_metadata_b,
         ),
         "row_a": row_a,
         "row_b": row_b,

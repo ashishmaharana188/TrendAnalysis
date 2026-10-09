@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import json
 import os
+from math import isfinite
 import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime
@@ -19,11 +20,35 @@ from .outcome_labels import OUTCOME_CLASSES
 SNAPSHOT_SCHEMA_VERSION = "2"
 SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS = frozenset({"1", SNAPSHOT_SCHEMA_VERSION})
 PHASE5_BASELINE_VERSION = "5.8"
+FOLD_RECORDING_CONTRACT_VERSION = 1
+REQUIRED_FOLD_RECORDING_FIELDS = (
+    "method_a_probabilities_pct",
+    "method_b_probabilities_pct",
+    "method_a_output",
+    "method_b_output",
+    "method_a_selection_metadata",
+    "method_b_selection_metadata",
+    "selection_metadata",
+    "outcome_thresholds",
+    "prediction_provenance",
+    "prediction_result",
+    "current_states",
+    "benchmark_return_pct",
+    "relative_return_pct",
+    "outcome_end_date",
+    "fold_recording_contract_version",
+)
 REQUIRED_PHASE5_SOURCES = (
+    "analysis/phase5_snapshot.py",
+    "tests/test_real_olap_prediction.py",
     "analysis/relationship.py",
     "analysis/relationship_graph.py",
     "analysis/hardening_4_10.py",
     "analysis/walk_forward_relationship.py",
+    "analysis/fast_permutation.py",
+    "analysis/relationship_fastpath.py",
+    "analysis/conviction.py",
+    "analysis/prediction_hardening.py",
     "analysis/real_olap_validation.py",
     "analysis/real_prediction_validation.py",
     "analysis/prediction.py",
@@ -116,6 +141,94 @@ def _rows_from_prediction_folds(folds: Iterable[Any]) -> list[dict[str, Any]]:
         else:
             rows.append(dict(fold))
     return rows
+
+
+def validate_fold_recording_contract(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
+    """Fail closed if new Phase 5.8 exports omit method outputs or audit metadata.
+
+    Legacy snapshots remain loadable. This validator is applied to new exports and
+    to manifests that explicitly declare the recording-contract version.
+    """
+    rows = list(rows)
+    method_present = {"A": 0, "B": 0}
+    vectors_recorded = {"A": 0, "B": 0}
+    usable_vectors = {"A": 0, "B": 0}
+    required = set(REQUIRED_FOLD_RECORDING_FIELDS)
+    for index, row in enumerate(rows, start=1):
+        missing = sorted(required - set(row))
+        if missing:
+            raise ValueError(
+                f"Fold {index} violates recording contract v{FOLD_RECORDING_CONTRACT_VERSION}; "
+                f"missing fields: {missing}"
+            )
+        if row.get("fold_recording_contract_version") != FOLD_RECORDING_CONTRACT_VERSION:
+            raise ValueError(f"Fold {index} has an unsupported recording-contract version.")
+        if not isinstance(row.get("selection_metadata"), dict):
+            raise ValueError(f"Fold {index} selection_metadata must be a dictionary.")
+        if not isinstance(row.get("outcome_thresholds"), dict):
+            raise ValueError(f"Fold {index} outcome_thresholds must be a dictionary.")
+        if not isinstance(row.get("prediction_result"), dict):
+            raise ValueError(f"Fold {index} prediction_result must be a dictionary.")
+        if not isinstance(row.get("current_states"), dict):
+            raise ValueError(f"Fold {index} current_states must be a dictionary.")
+        for label, key in (("A", "method_a_output"), ("B", "method_b_output")):
+            output = row.get(key)
+            vector_key = f"method_{label.lower()}_probabilities_pct"
+            vector = row.get(vector_key)
+            if output is not None:
+                if not isinstance(output, dict):
+                    raise ValueError(f"Fold {index} {key} must be a dictionary or null.")
+                if not isinstance(output.get("probabilities_pct"), dict):
+                    raise ValueError(f"Fold {index} {key} is missing its probability vector.")
+                if output["probabilities_pct"] != vector:
+                    raise ValueError(
+                        f"Fold {index} {vector_key} differs from the exact method output vector."
+                    )
+                if not isinstance(vector, dict) or any(label_name not in vector for label_name in OUTCOME_CLASSES):
+                    raise ValueError(
+                        f"Fold {index} {vector_key} must contain all three outcome classes."
+                    )
+                try:
+                    numeric_values = [float(vector[label_name]) for label_name in OUTCOME_CLASSES]
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Fold {index} {vector_key} contains a non-numeric probability.") from exc
+                if any(not isfinite(value) or value < 0.0 for value in numeric_values):
+                    raise ValueError(f"Fold {index} {vector_key} contains a non-finite or negative probability.")
+                vector_total = sum(numeric_values)
+                if vector_total > 0.0 and abs(vector_total - 100.0) > 0.25:
+                    raise ValueError(f"Fold {index} {vector_key} sums to {vector_total:.6f}, not 100%. ")
+                if vector_total == 0.0 and not bool(output.get("limited")):
+                    raise ValueError(f"Fold {index} {vector_key} is all zero but the method is not marked limited.")
+                method_present[label] += 1
+                if vector:
+                    vectors_recorded[label] += 1
+                if vector_total > 0.0:
+                    usable_vectors[label] += 1
+            elif vector not in ({}, None):
+                raise ValueError(
+                    f"Fold {index} has a {label} vector but no corresponding method output."
+                )
+            metadata = row.get(f"method_{label.lower()}_selection_metadata")
+            if not isinstance(metadata, dict) or not metadata.get("selection_status"):
+                raise ValueError(
+                    f"Fold {index} lacks explicit Method {label} selection status."
+                )
+        if row["selection_metadata"].get("recording_contract_version") != FOLD_RECORDING_CONTRACT_VERSION:
+            raise ValueError(f"Fold {index} selection metadata version is missing or inconsistent.")
+
+    return {
+        "version": FOLD_RECORDING_CONTRACT_VERSION,
+        "validated": True,
+        "fold_count": len(rows),
+        "method_a_outputs_recorded": method_present["A"],
+        "method_b_outputs_recorded": method_present["B"],
+        "method_a_probability_vectors_recorded": vectors_recorded["A"],
+        "method_b_probability_vectors_recorded": vectors_recorded["B"],
+        "method_a_usable_probability_distributions": usable_vectors["A"],
+        "method_b_usable_probability_distributions": usable_vectors["B"],
+        "probability_source": "PredictionResult.method_a/method_b outputs; never inferred from combined probabilities",
+        "selection_metadata_source": "nested walk-forward fold gate when hardened validation is enabled; otherwise explicitly marked direct mode",
+    }
 
 
 def _normalise_market_table(table: pa.Table, instrument: str) -> pa.Table:
@@ -241,7 +354,8 @@ def export_phase5_snapshot(
     if destination.exists():
         raise FileExistsError(
             f"Snapshot already exists: {destination}. "
-            "Frozen Phase 5 snapshots are immutable; create a new version instead."
+            "Frozen Phase 5 snapshots are immutable. The canonical run artifact already exists; "
+        "move it aside only when intentionally replacing it after a new validation run."
         )
 
     repo = Path(repository_root) if repository_root else Path.cwd()
@@ -261,16 +375,16 @@ def export_phase5_snapshot(
     )
 
     try:
+        fold_rows = _rows_from_prediction_folds(result.prediction_folds)
+        recording_contract = validate_fold_recording_contract(fold_rows)
+
         folds_path = temp_dir / "prediction_folds.jsonl.gz"
         panel_path = temp_dir / "panel_observations.jsonl.gz"
         summary_path = temp_dir / "phase5_result_summary.json"
         config_path = temp_dir / "phase5_config.json"
         market_path = temp_dir / "market_daily.parquet"
 
-        _write_jsonl_gzip(
-            folds_path,
-            _rows_from_prediction_folds(result.prediction_folds),
-        )
+        _write_jsonl_gzip(folds_path, fold_rows)
         _write_jsonl_gzip(
             panel_path,
             (
@@ -279,7 +393,15 @@ def export_phase5_snapshot(
             ),
         )
 
-        _write_json(summary_path, result.as_dict())
+        # Keep the summary compact. Every full fold is already stored once in
+        # prediction_folds.jsonl.gz; duplicating all folds in pretty JSON would
+        # inflate the canonical artifact without adding information.
+        result_summary = result.as_dict()
+        if isinstance(result_summary, dict):
+            result_summary.pop("prediction_folds", None)
+            result_summary["prediction_fold_count"] = len(result.prediction_folds)
+            result_summary["prediction_folds_artifact"] = folds_path.name
+        _write_json(summary_path, result_summary)
         _write_json(
             config_path,
             {
@@ -380,6 +502,8 @@ def export_phase5_snapshot(
             "prediction_fold_count": len(result.prediction_folds),
             "panel_observation_count": len(result.panel_observations),
             "outcome_classes": list(OUTCOME_CLASSES),
+            "fold_recording_contract_version": FOLD_RECORDING_CONTRACT_VERSION,
+            "fold_recording_contract": recording_contract,
             "source_sha256": source_hashes,
             "artifact_sha256": file_hashes,
             "immutability": {
@@ -484,6 +608,11 @@ def load_phase5_snapshot(
     expected_panel = int(manifest.get("panel_observation_count", -1))
     if len(folds) != expected_folds:
         raise ValueError("Prediction-fold count does not match manifest.")
+    if manifest.get("fold_recording_contract_version") is not None:
+        contract = validate_fold_recording_contract(folds)
+        expected_contract = manifest.get("fold_recording_contract", {})
+        if expected_contract and contract != expected_contract:
+            raise ValueError("Fold recording-contract summary does not match the manifest.")
     if len(panel) != expected_panel:
         raise ValueError("Panel-observation count does not match manifest.")
 
@@ -503,12 +632,20 @@ def default_snapshot_path(
     config: Any,
     *,
     root: str | Path = "artifacts/phase5_8",
-    version: str = "v2",
+    version: str | None = None,
 ) -> Path:
+    """Return the canonical, unversioned run-artifact path by default.
+
+    ``version`` remains an explicit compatibility option for callers that need
+    to address an existing legacy snapshot. Normal Phase 5.8 runs should not
+    create an arbitrary sequence of v1/v2/v3 directories.
+    """
     safe_ticker = str(config.ticker).replace("/", "_")
     safe_benchmark = str(config.benchmark).replace("/", "_")
     name = (
         f"{safe_ticker}_{safe_benchmark}_"
-        f"{config.analysis_timeframe}_{config.holding_period_months:g}M_{version}"
+        f"{config.analysis_timeframe}_{config.holding_period_months:g}M"
     )
+    if version:
+        name = f"{name}_{version}"
     return Path(root) / name

@@ -27,6 +27,102 @@ PredictionTrend = str
 _LOGGER = logging.getLogger("trendanalysis.phase5.real_olap")
 
 
+def _object_as_dict(value: Any) -> dict[str, Any] | None:
+    if value is None:
+        return None
+    if isinstance(value, dict):
+        return dict(value)
+    if hasattr(value, "as_dict"):
+        result = value.as_dict()
+        return dict(result) if isinstance(result, dict) else None
+    return None
+
+
+def _method_selection_record(
+    method_name: str,
+    *,
+    source: str,
+    selected_relationship: Any = None,
+    ranking: Any = None,
+    prediction_method: Any = None,
+    gate_metadata: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    selected_record = _object_as_dict(selected_relationship)
+    ranking_record = _object_as_dict(ranking)
+    method_record = _object_as_dict(prediction_method)
+    if source == "nested_hardened_walk_forward":
+        selected = selected_relationship is not None
+        status = (
+            "SELECTED_AFTER_ADJUSTED_P_THRESHOLD"
+            if selected else "NO_RELATIONSHIP_PASSED_SELECTION_GATE"
+        )
+    else:
+        selected = None  # Direct mode does not expose an independent nested selection result.
+        status = (
+            "METHOD_OUTPUT_AVAILABLE_SELECTION_STAGE_NOT_EXPOSED"
+            if method_record is not None else "NO_METHOD_OUTPUT"
+        )
+    return {
+        "method": method_name,
+        "selection_source": source,
+        "selection_status": status,
+        "selected_after_selection_gate": selected,
+        "selected_relationship": selected_record,
+        "ranking": ranking_record,
+        "prediction_method_output": method_record,
+        "gate_metadata": dict(gate_metadata) if gate_metadata is not None else None,
+    }
+
+
+def _fold_selection_metadata(
+    config: Any,
+    *,
+    nested_fold: Any = None,
+    selected_a: Any = None,
+    selected_b: Any = None,
+    ranking_a: Any = None,
+    ranking_b: Any = None,
+    method_a: Any = None,
+    method_b: Any = None,
+    nested_run_summary: Any = None,
+) -> dict[str, Any]:
+    source = "nested_hardened_walk_forward" if nested_fold is not None else "prediction_engine_direct"
+    nested_dict = _object_as_dict(nested_fold)
+    return {
+        "recording_contract_version": 1,
+        "selection_mode": source,
+        "selection_fraction": getattr(config, "selection_fraction", None),
+        "multiple_testing_alpha": getattr(config, "multiple_testing_alpha", None),
+        "purge_overlapping_labels": True if nested_fold is not None else None,
+        "method_a": _method_selection_record(
+            "A", source=source, selected_relationship=selected_a, ranking=ranking_a,
+            prediction_method=method_a,
+            gate_metadata=(nested_dict or {}).get("method_a_selection_metadata"),
+        ),
+        "method_b": _method_selection_record(
+            "B", source=source, selected_relationship=selected_b, ranking=ranking_b,
+            prediction_method=method_b,
+            gate_metadata=(nested_dict or {}).get("method_b_selection_metadata"),
+        ),
+        "nested_selection_fold": nested_dict,
+        "nested_run_summary": (
+            {
+                key: getattr(nested_run_summary, key)
+                for key in (
+                    "selection_candidate_evaluations",
+                    "selection_validated_predictions",
+                    "multiple_testing_controlled_folds",
+                    "leakage_violations",
+                    "purged_training_observations",
+                    "unknown_overlap_observations",
+                )
+                if hasattr(nested_run_summary, key)
+            }
+            if nested_run_summary is not None else None
+        ),
+    }
+
+
 def _configure_phase5_progress(enabled: bool) -> None:
     if not enabled:
         return
@@ -65,8 +161,22 @@ class PredictionFoldResult:
     trade_reason: str
     method_a_probabilities_pct: dict[OutcomeClass, float] = field(default_factory=dict)
     method_b_probabilities_pct: dict[OutcomeClass, float] = field(default_factory=dict)
+    benchmark_return_pct: float | None = None
+    relative_return_pct: float | None = None
+    outcome_end_date: date | None = None
+    current_states: dict[str, str] = field(default_factory=dict)
+    method_a_output: dict[str, Any] | None = None
+    method_b_output: dict[str, Any] | None = None
+    method_a_selection_metadata: dict[str, Any] | None = None
+    method_b_selection_metadata: dict[str, Any] | None = None
+    selection_metadata: dict[str, Any] = field(default_factory=dict)
+    outcome_thresholds: dict[str, Any] = field(default_factory=dict)
+    prediction_provenance: dict[str, Any] | None = None
+    prediction_result: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
+        method_a_output = self.method_a_output if isinstance(self.method_a_output, dict) else {}
+        method_b_output = self.method_b_output if isinstance(self.method_b_output, dict) else {}
         return {
             "prediction_date": self.prediction_date,
             "observed_trend": self.observed_trend,
@@ -82,6 +192,29 @@ class PredictionFoldResult:
             "method_b_trend": self.method_b_trend,
             "method_a_probabilities_pct": dict(self.method_a_probabilities_pct),
             "method_b_probabilities_pct": dict(self.method_b_probabilities_pct),
+            "method_a_output": dict(self.method_a_output) if self.method_a_output is not None else None,
+            "method_b_output": dict(self.method_b_output) if self.method_b_output is not None else None,
+            "method_a_evidence_score": method_a_output.get("evidence_score"),
+            "method_b_evidence_score": method_b_output.get("evidence_score"),
+            "method_a_effective_sample_size": method_a_output.get("effective_sample_size"),
+            "method_b_effective_sample_size": method_b_output.get("effective_sample_size"),
+            "method_a_sample_count": method_a_output.get("sample_count"),
+            "method_b_sample_count": method_b_output.get("sample_count"),
+            "method_a_variables": list(method_a_output.get("variables") or []),
+            "method_b_variables": list(method_b_output.get("variables") or []),
+            "method_a_condition": list(method_a_output.get("condition") or []),
+            "method_b_condition": list(method_b_output.get("condition") or []),
+            "method_a_selection_metadata": self.method_a_selection_metadata,
+            "method_b_selection_metadata": self.method_b_selection_metadata,
+            "selection_metadata": dict(self.selection_metadata),
+            "outcome_thresholds": dict(self.outcome_thresholds),
+            "prediction_provenance": dict(self.prediction_provenance) if self.prediction_provenance is not None else None,
+            "prediction_result": dict(self.prediction_result) if self.prediction_result is not None else None,
+            "benchmark_return_pct": self.benchmark_return_pct,
+            "relative_return_pct": self.relative_return_pct,
+            "outcome_end_date": self.outcome_end_date,
+            "current_states": dict(self.current_states),
+            "fold_recording_contract_version": 1,
             "method_agreement": self.method_agreement,
             "limited": self.limited,
             "provenance_clean": self.provenance_clean,
@@ -430,6 +563,17 @@ def validate_real_olap_predictions(
             actual_class = classify_return(actual_numeric, thresholds)
             hit = _directional_hit(result.trend, actual_class)
             conviction_counts[result.conviction] = conviction_counts.get(result.conviction, 0) + 1
+            selection_record = _fold_selection_metadata(
+                config,
+                nested_fold=selected_fold,
+                selected_a=selected_a,
+                selected_b=selected_b,
+                ranking_a=ranking_a,
+                ranking_b=ranking_b,
+                method_a=result.method_a,
+                method_b=result.method_b,
+                nested_run_summary=nested,
+            )
             folds.append(
                 PredictionFoldResult(
                     prediction_date=cutoff,
@@ -450,6 +594,18 @@ def validate_real_olap_predictions(
                     method_b_probabilities_pct=(
                         dict(result.method_b.probabilities_pct) if result.method_b else {}
                     ),
+                    benchmark_return_pct=observation.benchmark_return_pct,
+                    relative_return_pct=observation.relative_return_pct,
+                    outcome_end_date=observation.outcome_end_date,
+                    current_states=dict(observation.states),
+                    method_a_output=_object_as_dict(result.method_a),
+                    method_b_output=_object_as_dict(result.method_b),
+                    method_a_selection_metadata=selection_record["method_a"],
+                    method_b_selection_metadata=selection_record["method_b"],
+                    selection_metadata=selection_record,
+                    outcome_thresholds=thresholds.as_dict(),
+                    prediction_provenance=_object_as_dict(audit),
+                    prediction_result=_object_as_dict(result),
                     method_agreement=result.method_agreement,
                     limited=result.limited,
                     provenance_clean=provenance_clean,
@@ -576,6 +732,11 @@ def validate_real_olap_predictions(
         actual_class = classify_return(actual_numeric, thresholds)
         hit = _directional_hit(result.trend, actual_class)
         conviction_counts[result.conviction] = conviction_counts.get(result.conviction, 0) + 1
+        selection_record = _fold_selection_metadata(
+            config,
+            method_a=result.method_a,
+            method_b=result.method_b,
+        )
 
         folds.append(
             PredictionFoldResult(
@@ -597,6 +758,18 @@ def validate_real_olap_predictions(
                 method_b_probabilities_pct=(
                     dict(result.method_b.probabilities_pct) if result.method_b else {}
                 ),
+                benchmark_return_pct=observation.benchmark_return_pct,
+                relative_return_pct=observation.relative_return_pct,
+                outcome_end_date=observation.outcome_end_date,
+                current_states=dict(observation.states),
+                method_a_output=_object_as_dict(result.method_a),
+                method_b_output=_object_as_dict(result.method_b),
+                method_a_selection_metadata=selection_record["method_a"],
+                method_b_selection_metadata=selection_record["method_b"],
+                selection_metadata=selection_record,
+                outcome_thresholds=thresholds.as_dict(),
+                prediction_provenance=_object_as_dict(audit),
+                prediction_result=_object_as_dict(result),
                 method_agreement=result.method_agreement,
                 limited=result.limited,
                 provenance_clean=provenance_clean,

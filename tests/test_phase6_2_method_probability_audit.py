@@ -96,6 +96,70 @@ def _fold(
         trade_reason="TEST_FIXTURE",
         method_a_probabilities_pct=dict(method_a or {}),
         method_b_probabilities_pct=dict(method_b or {}),
+        benchmark_return_pct=0.5,
+        relative_return_pct=1.0,
+        outcome_end_date=date(2026, 9, 24),
+        current_states={"company.market.price": "Rising / High"},
+        method_a_output=(
+            {
+                "probabilities_pct": dict(method_a),
+                "evidence_score": 1.2,
+                "effective_sample_size": 18.0,
+                "sample_count": 20,
+                "variables": ["company.market.price", "macro.Brent_Crude"],
+                "condition": ["company.market.price=Rising", "macro.Brent_Crude=High"],
+                "limited": False,
+                "limitations": [],
+            } if method_a is not None else None
+        ),
+        method_b_output=(
+            {
+                "probabilities_pct": dict(method_b),
+                "evidence_score": -0.7,
+                "effective_sample_size": 11.0,
+                "sample_count": 14,
+                "variables": ["industry.market", "macro.Brent_Crude"],
+                "condition": ["industry.market=Stable", "macro.Brent_Crude=High"],
+                "limited": False,
+                "limitations": [],
+            } if method_b is not None else None
+        ),
+        method_a_selection_metadata={
+            "method": "A",
+            "selection_source": "test_fixture",
+            "selection_status": "SELECTED_AFTER_ADJUSTED_P_THRESHOLD" if method_a is not None else "NO_METHOD_OUTPUT",
+            "selected_after_selection_gate": method_a is not None,
+            "selected_relationship": None,
+            "ranking": None,
+            "prediction_method_output": None,
+            "gate_metadata": {"candidate_evaluation_count": 10, "multiple_testing": {"alpha": 0.1, "permutations_run": 199}},
+        },
+        method_b_selection_metadata={
+            "method": "B",
+            "selection_source": "test_fixture",
+            "selection_status": "SELECTED_AFTER_ADJUSTED_P_THRESHOLD" if method_b is not None else "NO_METHOD_OUTPUT",
+            "selected_after_selection_gate": method_b is not None,
+            "selected_relationship": None,
+            "ranking": None,
+            "prediction_method_output": None,
+            "gate_metadata": {"candidate_evaluation_count": 12, "multiple_testing": {"alpha": 0.1, "permutations_run": 199}},
+        },
+        selection_metadata={
+            "recording_contract_version": 1,
+            "selection_mode": "nested_hardened_walk_forward",
+            "method_a": {"selection_status": "SELECTED" if method_a is not None else "NONE"},
+            "method_b": {"selection_status": "SELECTED" if method_b is not None else "NONE"},
+            "nested_selection_fold": None,
+            "nested_run_summary": {"selection_candidate_evaluations": 22},
+        },
+        outcome_thresholds={"limited": False, "down_threshold_pct": -1.0, "up_threshold_pct": 1.0},
+        prediction_provenance={"clean": True, "threshold_fit_end_date": "2026-07-01"},
+        prediction_result={
+            "trend": "UP",
+            "probabilities_pct": dict(COMBINED),
+            "method_a": {"probabilities_pct": dict(method_a or {})} if method_a is not None else None,
+            "method_b": {"probabilities_pct": dict(method_b or {})} if method_b is not None else None,
+        },
     )
 
 
@@ -131,20 +195,37 @@ def test_fold_result_serializes_exact_method_probability_vectors() -> None:
     row = _fold().as_dict()
     assert row["method_a_probabilities_pct"] == METHOD_A
     assert row["method_b_probabilities_pct"] == METHOD_B
+    assert row["method_a_output"]["probabilities_pct"] == METHOD_A
+    assert row["method_b_output"]["probabilities_pct"] == METHOD_B
+    assert row["method_a_evidence_score"] == 1.2
+    assert row["method_b_sample_count"] == 14
+    assert row["method_a_variables"] == ["company.market.price", "macro.Brent_Crude"]
+    assert row["method_a_selection_metadata"]["gate_metadata"]["candidate_evaluation_count"] == 10
+    assert row["selection_metadata"]["recording_contract_version"] == 1
 
 
 def test_method_probability_vectors_survive_snapshot_round_trip_and_reach_audit() -> None:
     with tempfile.TemporaryDirectory() as temp:
-        snapshot_path = _export_snapshot(Path(temp) / "RELIANCE_Nifty_50_6M_1M_v2")
+        snapshot_path = _export_snapshot(Path(temp) / "RELIANCE_Nifty_50_6M_1M")
         snapshot = load_phase5_snapshot(snapshot_path)
 
         assert snapshot.manifest["schema_version"] == SNAPSHOT_SCHEMA_VERSION == "2"
         assert snapshot.manifest["status"] == "FROZEN"
+        assert snapshot.manifest["fold_recording_contract_version"] == 1
+        assert snapshot.manifest["fold_recording_contract"]["validated"] is True
+        assert snapshot.manifest["fold_recording_contract"]["method_a_outputs_recorded"] == 1
+        assert snapshot.manifest["fold_recording_contract"]["method_a_probability_vectors_recorded"] == 1
+        assert snapshot.manifest["fold_recording_contract"]["method_a_usable_probability_distributions"] == 1
         assert len(snapshot.prediction_folds) == 1
 
         serialized = snapshot.prediction_folds[0]
         assert serialized["method_a_probabilities_pct"] == METHOD_A
         assert serialized["method_b_probabilities_pct"] == METHOD_B
+        assert serialized["method_a_output"]["variables"] == ["company.market.price", "macro.Brent_Crude"]
+        assert serialized["method_b_output"]["effective_sample_size"] == 11.0
+        assert serialized["selection_metadata"]["method_a"]["selection_status"] == "SELECTED"
+        assert serialized["outcome_thresholds"]["up_threshold_pct"] == 1.0
+        assert serialized["prediction_provenance"]["clean"] is True
 
         audit_folds = load_folds(str(snapshot_path))
         assert len(audit_folds) == 1
@@ -156,7 +237,7 @@ def test_method_probability_vectors_survive_snapshot_round_trip_and_reach_audit(
 def test_unavailable_method_is_not_given_fabricated_probabilities() -> None:
     with tempfile.TemporaryDirectory() as temp:
         snapshot_path = _export_snapshot(
-            Path(temp) / "RELIANCE_Nifty_50_6M_1M_v2",
+            Path(temp) / "unavailable-method-snapshot",
             method_a=METHOD_A,
             method_b=None,
         )
@@ -170,9 +251,9 @@ def test_unavailable_method_is_not_given_fabricated_probabilities() -> None:
         assert audit_folds[0].method_b_probabilities_pct is None
 
 
-def test_v1_manifest_remains_loadable_after_schema_v2_upgrade() -> None:
+def test_legacy_schema_remains_loadable_after_recording_contract_upgrade() -> None:
     with tempfile.TemporaryDirectory() as temp:
-        snapshot_path = _export_snapshot(Path(temp) / "snapshot_v2")
+        snapshot_path = _export_snapshot(Path(temp) / "canonical_snapshot")
         manifest_path = snapshot_path / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["schema_version"] = "1"

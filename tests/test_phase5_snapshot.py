@@ -7,6 +7,9 @@ import tempfile
 from datetime import date
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
@@ -119,7 +122,12 @@ def main() -> None:
                 },
             )()
         )
-        assert path.name == "RELIANCE_Nifty_50_6M_1M_v2"
+        assert path.name == "RELIANCE_Nifty_50_6M_1M"
+        explicit_legacy_path = default_snapshot_path(
+            type("Config", (), {"ticker": "RELIANCE", "benchmark": "Nifty_50", "analysis_timeframe": "6M", "holding_period_months": 1.0})(),
+            version="v1",
+        )
+        assert explicit_legacy_path.name == "RELIANCE_Nifty_50_6M_1M_v1"
 
     print("PHASE 5 SNAPSHOT TEST: PASS")
     print("Manifest validation: PASS")
