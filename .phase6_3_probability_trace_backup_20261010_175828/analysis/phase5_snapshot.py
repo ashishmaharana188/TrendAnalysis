@@ -20,8 +20,7 @@ from .outcome_labels import OUTCOME_CLASSES
 SNAPSHOT_SCHEMA_VERSION = "2"
 SUPPORTED_SNAPSHOT_SCHEMA_VERSIONS = frozenset({"1", SNAPSHOT_SCHEMA_VERSION})
 PHASE5_BASELINE_VERSION = "5.8"
-FOLD_RECORDING_CONTRACT_VERSION = 2
-SUPPORTED_FOLD_RECORDING_CONTRACT_VERSIONS = frozenset({1, FOLD_RECORDING_CONTRACT_VERSION})
+FOLD_RECORDING_CONTRACT_VERSION = 1
 REQUIRED_FOLD_RECORDING_FIELDS = (
     "method_a_probabilities_pct",
     "method_b_probabilities_pct",
@@ -144,101 +143,12 @@ def _rows_from_prediction_folds(folds: Iterable[Any]) -> list[dict[str, Any]]:
     return rows
 
 
-
-def _validate_probability_source_trace(
-    fold_index: int,
-    method_label: str,
-    output: dict[str, Any],
-    stored_probability_values: list[float],
-) -> None:
-    """Validate the builder metadata needed to explain empirical probabilities."""
-    from .outcome_labels import OUTCOME_CLASSES
-
-    vector_key = f"method_{method_label.lower()}_probabilities_pct"
-    for key in ("class_counts", "weighted_class_counts"):
-        mapping = output.get(key)
-        if not isinstance(mapping, dict) or any(label not in mapping for label in OUTCOME_CLASSES):
-            raise ValueError(
-                f"Fold {fold_index} method {method_label} output is missing valid {key} source trace."
-            )
-
-    counts: dict[str, float] = {}
-    weights: dict[str, float] = {}
-    for label in OUTCOME_CLASSES:
-        try:
-            count = float(output["class_counts"][label])
-            weight = float(output["weighted_class_counts"][label])
-        except (TypeError, ValueError, OverflowError) as exc:
-            raise ValueError(
-                f"Fold {fold_index} method {method_label} source counts are non-numeric."
-            ) from exc
-        if not isfinite(count) or count < 0.0 or not count.is_integer():
-            raise ValueError(
-                f"Fold {fold_index} method {method_label} class_counts must be finite non-negative integers."
-            )
-        if not isfinite(weight) or weight < 0.0:
-            raise ValueError(
-                f"Fold {fold_index} method {method_label} weighted_class_counts must be finite and non-negative."
-            )
-        counts[label] = count
-        weights[label] = weight
-
-    basis = output.get("probability_basis")
-    if not isinstance(basis, str) or not basis.strip():
-        raise ValueError(
-            f"Fold {fold_index} method {method_label} output is missing probability_basis."
-        )
-
-    # Limited outputs intentionally carry an all-zero vector and empty counts.
-    # Usable outputs must reconstruct exactly from the weighted class shares.
-    if bool(output.get("limited")):
-        return
-
-    try:
-        sample_count = float(output.get("sample_count"))
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ValueError(
-            f"Fold {fold_index} method {method_label} sample_count is missing or invalid."
-        ) from exc
-    if not isfinite(sample_count) or not sample_count.is_integer() or sample_count < 1:
-        raise ValueError(
-            f"Fold {fold_index} method {method_label} sample_count must be a positive integer."
-        )
-    if sum(counts.values()) != sample_count:
-        raise ValueError(
-            f"Fold {fold_index} method {method_label} class_counts sum to {sum(counts.values()):g}, "
-            f"but sample_count is {sample_count:g}."
-        )
-
-    total_weight = sum(weights.values())
-    if not isfinite(total_weight) or total_weight <= 0.0:
-        raise ValueError(
-            f"Fold {fold_index} method {method_label} usable output has no positive weighted class mass."
-        )
-    for label, stored_value in zip(OUTCOME_CLASSES, stored_probability_values):
-        reconstructed_pct = weights[label] / total_weight * 100.0
-        if abs(reconstructed_pct - stored_value) > 1e-4:
-            raise ValueError(
-                f"Fold {fold_index} {vector_key} does not match weighted_class_counts "
-                f"for {label}: stored={stored_value:.8f}, reconstructed={reconstructed_pct:.8f}."
-            )
-
-
-def validate_fold_recording_contract(
-    rows: Iterable[dict[str, Any]],
-    *,
-    contract_version: int | None = None,
-) -> dict[str, Any]:
+def validate_fold_recording_contract(rows: Iterable[dict[str, Any]]) -> dict[str, Any]:
     """Fail closed if new Phase 5.8 exports omit method outputs or audit metadata.
 
     Legacy snapshots remain loadable. This validator is applied to new exports and
     to manifests that explicitly declare the recording-contract version.
     """
-    expected_version = (
-        FOLD_RECORDING_CONTRACT_VERSION if contract_version is None else int(contract_version)
-    )
-    if expected_version not in SUPPORTED_FOLD_RECORDING_CONTRACT_VERSIONS:
-        raise ValueError(f"Unsupported fold recording-contract version: {expected_version!r}")
     rows = list(rows)
     method_present = {"A": 0, "B": 0}
     vectors_recorded = {"A": 0, "B": 0}
@@ -248,10 +158,10 @@ def validate_fold_recording_contract(
         missing = sorted(required - set(row))
         if missing:
             raise ValueError(
-                f"Fold {index} violates recording contract v{expected_version}; "
+                f"Fold {index} violates recording contract v{FOLD_RECORDING_CONTRACT_VERSION}; "
                 f"missing fields: {missing}"
             )
-        if row.get("fold_recording_contract_version") != expected_version:
+        if row.get("fold_recording_contract_version") != FOLD_RECORDING_CONTRACT_VERSION:
             raise ValueError(f"Fold {index} has an unsupported recording-contract version.")
         if not isinstance(row.get("selection_metadata"), dict):
             raise ValueError(f"Fold {index} selection_metadata must be a dictionary.")
@@ -289,8 +199,6 @@ def validate_fold_recording_contract(
                     raise ValueError(f"Fold {index} {vector_key} sums to {vector_total:.6f}, not 100%. ")
                 if vector_total == 0.0 and not bool(output.get("limited")):
                     raise ValueError(f"Fold {index} {vector_key} is all zero but the method is not marked limited.")
-                if expected_version >= 2:
-                    _validate_probability_source_trace(index, label, output, numeric_values)
                 method_present[label] += 1
                 if vector:
                     vectors_recorded[label] += 1
@@ -305,11 +213,11 @@ def validate_fold_recording_contract(
                 raise ValueError(
                     f"Fold {index} lacks explicit Method {label} selection status."
                 )
-        if row["selection_metadata"].get("recording_contract_version") != expected_version:
+        if row["selection_metadata"].get("recording_contract_version") != FOLD_RECORDING_CONTRACT_VERSION:
             raise ValueError(f"Fold {index} selection metadata version is missing or inconsistent.")
 
     return {
-        "version": expected_version,
+        "version": FOLD_RECORDING_CONTRACT_VERSION,
         "validated": True,
         "fold_count": len(rows),
         "method_a_outputs_recorded": method_present["A"],
@@ -701,9 +609,7 @@ def load_phase5_snapshot(
     if len(folds) != expected_folds:
         raise ValueError("Prediction-fold count does not match manifest.")
     if manifest.get("fold_recording_contract_version") is not None:
-        contract = validate_fold_recording_contract(
-            folds, contract_version=int(manifest["fold_recording_contract_version"])
-        )
+        contract = validate_fold_recording_contract(folds)
         expected_contract = manifest.get("fold_recording_contract", {})
         if expected_contract and contract != expected_contract:
             raise ValueError("Fold recording-contract summary does not match the manifest.")

@@ -89,7 +89,7 @@ def _fold_selection_metadata(
     source = "nested_hardened_walk_forward" if nested_fold is not None else "prediction_engine_direct"
     nested_dict = _object_as_dict(nested_fold)
     return {
-        "recording_contract_version": 2,
+        "recording_contract_version": 1,
         "selection_mode": source,
         "selection_fraction": getattr(config, "selection_fraction", None),
         "multiple_testing_alpha": getattr(config, "multiple_testing_alpha", None),
@@ -214,7 +214,7 @@ class PredictionFoldResult:
             "relative_return_pct": self.relative_return_pct,
             "outcome_end_date": self.outcome_end_date,
             "current_states": dict(self.current_states),
-            "fold_recording_contract_version": 2,
+            "fold_recording_contract_version": 1,
             "method_agreement": self.method_agreement,
             "limited": self.limited,
             "provenance_clean": self.provenance_clean,

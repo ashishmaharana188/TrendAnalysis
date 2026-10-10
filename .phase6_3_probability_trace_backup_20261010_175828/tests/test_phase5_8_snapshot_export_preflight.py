@@ -62,13 +62,10 @@ class FakeFold:
         method_a = {
             "probabilities_pct": {"UP": 67.0, "SIDEWAYS": 21.0, "DOWN": 12.0},
             "evidence_score": 1.2,
-            "effective_sample_size": 100.0,
-            "sample_count": 100,
+            "effective_sample_size": 18.0,
+            "sample_count": 20,
             "variables": ["company.market.price", "macro.Brent_Crude"],
             "condition": ["company.market.price=Rising", "macro.Brent_Crude=High"],
-            "class_counts": {"UP": 67, "SIDEWAYS": 21, "DOWN": 12},
-            "weighted_class_counts": {"UP": 67.0, "SIDEWAYS": 21.0, "DOWN": 12.0},
-            "probability_basis": "method_a_empirical_conditional_class_share",
             "limited": False,
             "limitations": [],
         }
@@ -79,12 +76,6 @@ class FakeFold:
             "sample_count": 14,
             "variables": ["industry.market", "macro.Brent_Crude"],
             "condition": ["industry.market=Stable", "macro.Brent_Crude=High"],
-            "class_counts": {"UP": 2, "SIDEWAYS": 4, "DOWN": 8},
-            "weighted_class_counts": {"UP": 14.0, "SIDEWAYS": 26.0, "DOWN": 60.0},
-            "probability_basis": "method_b_weighted_empirical_conditional_class_share",
-            "exact_condition_count": 2,
-            "weight_concentration": 0.12,
-            "stability_score": 0.7,
             "limited": False,
             "limitations": [],
         }
@@ -103,7 +94,7 @@ class FakeFold:
             "method_b_output": method_b,
             "method_a_selection_metadata": selection_a,
             "method_b_selection_metadata": selection_b,
-            "selection_metadata": {"recording_contract_version": 2, "selection_mode": "test_fixture", "method_a": selection_a, "method_b": selection_b, "nested_selection_fold": None, "nested_run_summary": {}},
+            "selection_metadata": {"recording_contract_version": 1, "selection_mode": "test_fixture", "method_a": selection_a, "method_b": selection_b, "nested_selection_fold": None, "nested_run_summary": {}},
             "outcome_thresholds": {"limited": False, "up_threshold_pct": 1.0, "down_threshold_pct": -1.0},
             "prediction_provenance": {"clean": True},
             "prediction_result": {"trend": self.predicted_trend, "probabilities_pct": self.probabilities_pct},
@@ -111,7 +102,7 @@ class FakeFold:
             "benchmark_return_pct": 0.5,
             "relative_return_pct": 1.0,
             "outcome_end_date": "2026-09-24",
-            "fold_recording_contract_version": 2,
+            "fold_recording_contract_version": 1,
         }
 
 

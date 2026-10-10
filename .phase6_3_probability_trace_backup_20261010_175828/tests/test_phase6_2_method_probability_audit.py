@@ -104,13 +104,10 @@ def _fold(
             {
                 "probabilities_pct": dict(method_a),
                 "evidence_score": 1.2,
-                "effective_sample_size": 100.0,
-                "sample_count": 100,
+                "effective_sample_size": 18.0,
+                "sample_count": 20,
                 "variables": ["company.market.price", "macro.Brent_Crude"],
                 "condition": ["company.market.price=Rising", "macro.Brent_Crude=High"],
-                "class_counts": {"UP": 67, "SIDEWAYS": 21, "DOWN": 12},
-                "weighted_class_counts": {"UP": 67.0, "SIDEWAYS": 21.0, "DOWN": 12.0},
-                "probability_basis": "method_a_empirical_conditional_class_share",
                 "limited": False,
                 "limitations": [],
             } if method_a is not None else None
@@ -123,12 +120,6 @@ def _fold(
                 "sample_count": 14,
                 "variables": ["industry.market", "macro.Brent_Crude"],
                 "condition": ["industry.market=Stable", "macro.Brent_Crude=High"],
-                "class_counts": {"UP": 2, "SIDEWAYS": 4, "DOWN": 8},
-                "weighted_class_counts": {"UP": 14.0, "SIDEWAYS": 26.0, "DOWN": 60.0},
-                "probability_basis": "method_b_weighted_empirical_conditional_class_share",
-                "exact_condition_count": 2,
-                "weight_concentration": 0.12,
-                "stability_score": 0.7,
                 "limited": False,
                 "limitations": [],
             } if method_b is not None else None
@@ -154,7 +145,7 @@ def _fold(
             "gate_metadata": {"candidate_evaluation_count": 12, "multiple_testing": {"alpha": 0.1, "permutations_run": 199}},
         },
         selection_metadata={
-            "recording_contract_version": 2,
+            "recording_contract_version": 1,
             "selection_mode": "nested_hardened_walk_forward",
             "method_a": {"selection_status": "SELECTED" if method_a is not None else "NONE"},
             "method_b": {"selection_status": "SELECTED" if method_b is not None else "NONE"},
@@ -210,7 +201,7 @@ def test_fold_result_serializes_exact_method_probability_vectors() -> None:
     assert row["method_b_sample_count"] == 14
     assert row["method_a_variables"] == ["company.market.price", "macro.Brent_Crude"]
     assert row["method_a_selection_metadata"]["gate_metadata"]["candidate_evaluation_count"] == 10
-    assert row["selection_metadata"]["recording_contract_version"] == 2
+    assert row["selection_metadata"]["recording_contract_version"] == 1
 
 
 def test_method_probability_vectors_survive_snapshot_round_trip_and_reach_audit() -> None:
@@ -220,7 +211,7 @@ def test_method_probability_vectors_survive_snapshot_round_trip_and_reach_audit(
 
         assert snapshot.manifest["schema_version"] == SNAPSHOT_SCHEMA_VERSION == "2"
         assert snapshot.manifest["status"] == "FROZEN"
-        assert snapshot.manifest["fold_recording_contract_version"] == 2
+        assert snapshot.manifest["fold_recording_contract_version"] == 1
         assert snapshot.manifest["fold_recording_contract"]["validated"] is True
         assert snapshot.manifest["fold_recording_contract"]["method_a_outputs_recorded"] == 1
         assert snapshot.manifest["fold_recording_contract"]["method_a_probability_vectors_recorded"] == 1

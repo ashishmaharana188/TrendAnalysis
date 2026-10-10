@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import date
 from pathlib import Path
 import sys
 
@@ -9,7 +10,12 @@ if str(ROOT) not in sys.path:
 
 import pytest
 
-from phase6_2_probability_surface_audit import _distribution, _group_name, SnapshotFold
+from phase6_2_probability_surface_audit import (
+    SnapshotFold,
+    _distribution,
+    _group_name,
+    _surface_status,
+)
 
 
 def test_distribution_normalizes():
@@ -22,31 +28,32 @@ def test_distribution_handles_missing_class():
     assert result == pytest.approx({"UP": 50, "SIDEWAYS": 50, "DOWN": 0})
 
 
-def test_distribution_rejects_zero_mass():
+def test_distribution_rejects_zero_or_invalid_mass():
     assert _distribution({"UP": 0, "SIDEWAYS": 0, "DOWN": 0}) is None
+    assert _distribution({"UP": -10, "SIDEWAYS": 60, "DOWN": 50}) is None
 
 
-def test_group_classifies_method_agreement():
-    row = SnapshotFold(
-        prediction_date=__import__("datetime").date(2026, 1, 1),
+def _row(a: str | None, b: str | None) -> SnapshotFold:
+    return SnapshotFold(
+        prediction_date=date(2026, 1, 1),
         probabilities_pct={"UP": 50.0, "SIDEWAYS": 25.0, "DOWN": 25.0},
         actual_class="UP",
         predicted_trend="UP",
-        method_a_trend="UP",
-        method_b_trend="UP",
+        method_a_trend=a,
+        method_b_trend=b,
         baseline_probabilities_pct={"UP": 33.33, "SIDEWAYS": 33.33, "DOWN": 33.34},
     )
-    assert _group_name(row) == "BOTH_AGREE"
+
+
+def test_group_classifies_method_agreement():
+    assert _group_name(_row("UP", "UP")) == "BOTH_AGREE"
 
 
 def test_group_classifies_method_conflict():
-    row = SnapshotFold(
-        prediction_date=__import__("datetime").date(2026, 1, 1),
-        probabilities_pct={"UP": 50.0, "SIDEWAYS": 25.0, "DOWN": 25.0},
-        actual_class="UP",
-        predicted_trend="NO_CLEAR_TREND",
-        method_a_trend="UP",
-        method_b_trend="DOWN",
-        baseline_probabilities_pct={"UP": 33.33, "SIDEWAYS": 33.33, "DOWN": 33.34},
-    )
-    assert _group_name(row) == "BOTH_CONFLICT"
+    assert _group_name(_row("UP", "DOWN")) == "BOTH_CONFLICT"
+
+
+def test_surface_status_distinguishes_partial_from_unavailable():
+    assert _surface_status(208, 208) == "COMPLETE"
+    assert _surface_status(187, 208) == "PARTIAL"
+    assert _surface_status(0, 208) == "UNAVAILABLE"

@@ -15,26 +15,20 @@ def complete_row() -> dict:
     method_a = {
         "probabilities_pct": {"UP": 55.0, "SIDEWAYS": 25.0, "DOWN": 20.0},
         "evidence_score": 0.75,
-        "effective_sample_size": 20.0,
-        "sample_count": 20,
+        "effective_sample_size": 18.0,
+        "sample_count": 22,
         "variables": ["company.market.price"],
         "condition": ["company.market.price=Rising"],
         "limited": False,
-        "class_counts": {"UP": 11, "SIDEWAYS": 5, "DOWN": 4},
-        "weighted_class_counts": {"UP": 11.0, "SIDEWAYS": 5.0, "DOWN": 4.0},
-        "probability_basis": "method_a_empirical_conditional_class_share",
     }
     method_b = {
         "probabilities_pct": {"UP": 20.0, "SIDEWAYS": 25.0, "DOWN": 55.0},
         "evidence_score": -0.5,
-        "effective_sample_size": 20.0,
-        "sample_count": 20,
+        "effective_sample_size": 12.0,
+        "sample_count": 15,
         "variables": ["industry.market"],
         "condition": ["industry.market=Falling"],
         "limited": False,
-        "class_counts": {"UP": 4, "SIDEWAYS": 5, "DOWN": 11},
-        "weighted_class_counts": {"UP": 20.0, "SIDEWAYS": 25.0, "DOWN": 55.0},
-        "probability_basis": "method_b_weighted_empirical_conditional_class_share",
     }
     selection_a = {"selection_status": "SELECTED_AFTER_ADJUSTED_P_THRESHOLD"}
     selection_b = {"selection_status": "REJECTED_NO_CANDIDATE_PASSED_ADJUSTED_P_THRESHOLD"}
@@ -123,30 +117,3 @@ def test_walk_forward_fold_exports_gate_metadata_per_method() -> None:
     ).as_dict()
     assert fold["method_a_selection_metadata"]["multiple_testing"]["selected_adjusted_p_value"] == 0.04
     assert fold["method_b_selection_metadata"]["multiple_testing"]["accepted_candidate_count"] == 0
-
-
-def test_contract_v2_rejects_missing_builder_source_trace() -> None:
-    row = complete_row()
-    del row["method_a_output"]["class_counts"]
-    with pytest.raises(ValueError, match="class_counts source trace"):
-        validate_fold_recording_contract([row])
-
-
-def test_contract_v2_rejects_weighted_counts_that_do_not_reconstruct_vector() -> None:
-    row = complete_row()
-    row["method_b_output"]["weighted_class_counts"]["UP"] += 5.0
-    with pytest.raises(ValueError, match="does not match weighted_class_counts"):
-        validate_fold_recording_contract([row])
-
-
-def test_legacy_contract_v1_remains_validatable() -> None:
-    row = complete_row()
-    for method in ("a", "b"):
-        output = row[f"method_{method}_output"]
-        output.pop("class_counts")
-        output.pop("weighted_class_counts")
-        output.pop("probability_basis")
-    row["fold_recording_contract_version"] = 1
-    row["selection_metadata"]["recording_contract_version"] = 1
-    report = validate_fold_recording_contract([row], contract_version=1)
-    assert report["version"] == 1

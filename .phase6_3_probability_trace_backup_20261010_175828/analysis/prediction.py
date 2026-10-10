@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date, datetime
 from math import sqrt
 from typing import Any, Iterable, Literal
@@ -132,14 +132,6 @@ class MethodPrediction:
     decision: DecisionResult | None = None
     combination: CombinationResult | None = None
     conviction_result: ConvictionResult | None = None
-    # Source probability-builder diagnostics. These fields are audit-only;
-    # they do not change probability values or decision behavior.
-    class_counts: dict[OutcomeClass, int] = field(default_factory=dict)
-    weighted_class_counts: dict[OutcomeClass, float] = field(default_factory=dict)
-    probability_basis: str | None = None
-    exact_condition_count: int | None = None
-    weight_concentration: float | None = None
-    stability_score: float | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -160,12 +152,6 @@ class MethodPrediction:
             "limited": self.limited,
             "limitations": list(self.limitations),
             "decision": self.decision.as_dict() if self.decision else None,
-            "class_counts": dict(self.class_counts),
-            "weighted_class_counts": dict(self.weighted_class_counts),
-            "probability_basis": self.probability_basis,
-            "exact_condition_count": self.exact_condition_count,
-            "weight_concentration": self.weight_concentration,
-            "stability_score": self.stability_score,
         }
 
 
@@ -300,12 +286,6 @@ class PredictionEngine:
                 stable=probability.stable,
                 variables=probability.variables,
                 condition=probability.condition,
-            class_counts=dict(probability.class_counts),
-            weighted_class_counts=dict(probability.weighted_class_counts),
-            probability_basis=probability.probability_basis,
-            exact_condition_count=getattr(probability, "exact_condition_count", None),
-            weight_concentration=getattr(probability, "weight_concentration", None),
-            stability_score=getattr(probability, "stability_score", None),
                 limited=True,
                 limitations=probability.limitations,
                 decision=DecisionResult(
@@ -343,12 +323,6 @@ class PredictionEngine:
             stable=probability.stable,
             variables=probability.variables,
             condition=probability.condition,
-            class_counts=dict(probability.class_counts),
-            weighted_class_counts=dict(probability.weighted_class_counts),
-            probability_basis=probability.probability_basis,
-            exact_condition_count=getattr(probability, "exact_condition_count", None),
-            weight_concentration=getattr(probability, "weight_concentration", None),
-            stability_score=getattr(probability, "stability_score", None),
             limited=False,
             limitations=probability.limitations,
             decision=decision,
@@ -393,12 +367,6 @@ class PredictionEngine:
                 stable=probability.stable,
                 variables=probability.variables,
                 condition=probability.condition,
-            class_counts=dict(probability.class_counts),
-            weighted_class_counts=dict(probability.weighted_class_counts),
-            probability_basis=probability.probability_basis,
-            exact_condition_count=getattr(probability, "exact_condition_count", None),
-            weight_concentration=getattr(probability, "weight_concentration", None),
-            stability_score=getattr(probability, "stability_score", None),
                 limited=True,
                 limitations=probability.limitations,
                 decision=DecisionResult(
@@ -437,12 +405,6 @@ class PredictionEngine:
             stable=probability.stable,
             variables=probability.variables,
             condition=probability.condition,
-            class_counts=dict(probability.class_counts),
-            weighted_class_counts=dict(probability.weighted_class_counts),
-            probability_basis=probability.probability_basis,
-            exact_condition_count=getattr(probability, "exact_condition_count", None),
-            weight_concentration=getattr(probability, "weight_concentration", None),
-            stability_score=getattr(probability, "stability_score", None),
             decision=decision,
         )
 

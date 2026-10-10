@@ -5,20 +5,33 @@ from pathlib import Path
 import sys
 import types
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-# This overlay test exercises Phase 6 code without requiring the rest of the
-# full TrendAnalysis dependency graph. The real repository already provides
-# analysis.outcome_labels.
-stub = types.ModuleType("analysis.outcome_labels")
-stub.OUTCOME_CLASSES = ("UP", "SIDEWAYS", "DOWN")
-stub.OutcomeClass = str
-sys.modules["analysis.outcome_labels"] = stub
+# Keep this small unit test independent of the real Phase 5 relationship graph,
+# but restore sys.modules and the package attribute after importing the code.
+# This prevents a stub from contaminating other tests collected in the same run.
+_previous_outcome_labels = sys.modules.get("analysis.outcome_labels")
+_stub = types.ModuleType("analysis.outcome_labels")
+_stub.OUTCOME_CLASSES = ("UP", "SIDEWAYS", "DOWN")
+_stub.OutcomeClass = str
+sys.modules["analysis.outcome_labels"] = _stub
 
 from analysis.phase6_calibration import CalibratedPrediction
 from analysis.phase6_selective import evaluate_selective_predictions
+
+_analysis_package = sys.modules.get("analysis")
+if _previous_outcome_labels is None:
+    sys.modules.pop("analysis.outcome_labels", None)
+    if _analysis_package is not None and getattr(_analysis_package, "outcome_labels", None) is _stub:
+        delattr(_analysis_package, "outcome_labels")
+else:
+    sys.modules["analysis.outcome_labels"] = _previous_outcome_labels
+    if _analysis_package is not None and getattr(_analysis_package, "outcome_labels", None) is _stub:
+        setattr(_analysis_package, "outcome_labels", _previous_outcome_labels)
 
 
 def _prediction(day: int, probs: dict[str, float], actual: str) -> CalibratedPrediction:
@@ -41,19 +54,12 @@ def test_fixed_threshold_is_selective_and_above_baseline() -> None:
         _prediction(4, {"UP": 42, "SIDEWAYS": 40, "DOWN": 18}, "UP"),
         _prediction(5, {"UP": 40, "SIDEWAYS": 35, "DOWN": 25}, "DOWN"),
     ]
-
-    result = evaluate_selective_predictions(
-        predictions,
-        thresholds_pct=(40.0, 70.0),
-        development_fraction=4 / 6,
-    )
-
+    result = evaluate_selective_predictions(predictions, thresholds_pct=(40.0, 70.0), development_fraction=4 / 6)
     assert result.observations == 6
     assert result.baseline_accuracy_pct == 50.0
-
     at_70 = next(item for item in result.thresholds if item.threshold_pct == 70.0)
     assert at_70.selected_observations == 3
-    assert at_70.accuracy_pct == 66.66666666666666
+    assert at_70.accuracy_pct == pytest.approx(66.6666666667)
     assert at_70.improves_over_baseline
 
 
@@ -70,21 +76,21 @@ def test_chronological_selection_uses_final_period_only_for_evaluation() -> None
         _prediction(8, {"UP": 60, "SIDEWAYS": 25, "DOWN": 15}, "UP"),
         _prediction(9, {"UP": 55, "SIDEWAYS": 30, "DOWN": 15}, "DOWN"),
     ]
-
     result = evaluate_selective_predictions(
         predictions,
         thresholds_pct=(40.0, 60.0, 70.0),
         development_fraction=0.6,
         minimum_development_coverage_pct=10.0,
     )
-
     selected = result.selected_threshold
     assert selected.selection_status == "SELECTED_FROM_DEVELOPMENT"
-    assert selected.threshold_pct == 70.0
+    # At 60% and 70%, the first five development forecasts are selected.
+    # The tie-break is therefore lower threshold = 60%.
+    assert selected.threshold_pct == 60.0
     assert selected.development_observations == 6
     assert selected.final_observations == 4
-    assert selected.final_coverage_pct == 50.0
-    assert selected.final_accuracy_pct == 0.0
+    assert selected.final_coverage_pct == pytest.approx(75.0)
+    assert selected.final_accuracy_pct == pytest.approx(200.0 / 3.0)
 
 
 def test_threshold_uses_calibrated_confidence() -> None:
@@ -92,14 +98,8 @@ def test_threshold_uses_calibrated_confidence() -> None:
         _prediction(0, {"UP": 55, "SIDEWAYS": 25, "DOWN": 20}, "UP"),
         _prediction(1, {"UP": 49, "SIDEWAYS": 30, "DOWN": 21}, "DOWN"),
     ]
-
-    result = evaluate_selective_predictions(
-        predictions,
-        thresholds_pct=(50.0,),
-        development_fraction=0.5,
-    )
+    result = evaluate_selective_predictions(predictions, thresholds_pct=(50.0,), development_fraction=0.5)
     item = result.thresholds[0]
-
     assert item.selected_observations == 1
     assert item.accuracy_pct == 100.0
-    assert item.mean_confidence_pct == 55.0
+    assert item.mean_confidence_pct == pytest.approx(55.0)

@@ -1,15 +1,24 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
 import numpy as np
 
-from analysis.phase5_snapshot import load_phase5_snapshot
 from analysis.outcome_labels import OUTCOME_CLASSES
-from analysis.phase6_calibration import calibrate_phase5_folds
+from analysis.phase5_snapshot import load_phase5_snapshot
+from analysis.phase6_probability_metrics import (
+    as_date,
+    calibrate_with_mature_labels,
+    compare_probabilities_paired,
+    normalize_distribution,
+    print_paired_comparison,
+    print_score_line,
+    score_probabilities,
+)
 
 
 @dataclass(frozen=True)
@@ -23,41 +32,31 @@ class SnapshotFold:
     baseline_probabilities_pct: dict[str, float]
     method_a_probabilities_pct: dict[str, float] | None = None
     method_b_probabilities_pct: dict[str, float] | None = None
+    outcome_end_date: date | None = None
 
 
 def _date(value: Any) -> date:
-    if isinstance(value, date):
-        return value
-    return date.fromisoformat(str(value))
+    result = as_date(value)
+    if result is None:
+        raise ValueError("Prediction date is required.")
+    return result
 
 
 def _distribution(raw: Any) -> dict[str, float] | None:
-    if not isinstance(raw, dict):
-        return None
-    try:
-        values = {label: max(float(raw.get(label, 0.0)), 0.0) for label in OUTCOME_CLASSES}
-    except (TypeError, ValueError):
-        return None
-    total = sum(values.values())
-    if not np.isfinite(total) or total <= 0:
-        return None
-    return {label: values[label] / total * 100.0 for label in OUTCOME_CLASSES}
+    return normalize_distribution(raw)
 
 
 def _nested_method_distribution(row: dict[str, Any], method: str) -> dict[str, float] | None:
-    # Future-compatible: accept either nested method summary or explicit fold-level fields.
     candidates = [
         row.get(f"method_{method.lower()}_probabilities_pct"),
         row.get(f"{method.lower()}_probabilities_pct"),
     ]
     nested = row.get(f"method_{method.lower()}")
     if isinstance(nested, dict):
-        candidates.extend(
-            [
-                nested.get("probabilities_pct"),
-                nested.get("calibrated_probabilities_pct"),
-            ]
-        )
+        candidates.extend([nested.get("probabilities_pct"), nested.get("calibrated_probabilities_pct")])
+    output = row.get(f"method_{method.lower()}_output")
+    if isinstance(output, dict):
+        candidates.append(output.get("probabilities_pct"))
     for candidate in candidates:
         result = _distribution(candidate)
         if result is not None:
@@ -77,6 +76,7 @@ def load_folds(snapshot_root: str) -> list[SnapshotFold]:
         rows.append(
             SnapshotFold(
                 prediction_date=_date(row.get("prediction_date")),
+                outcome_end_date=as_date(row.get("outcome_end_date")),
                 probabilities_pct=probs,
                 actual_class=actual,
                 predicted_trend=str(row.get("predicted_trend", "NO_CLEAR_TREND")),
@@ -101,35 +101,28 @@ def _class_counts(values: list[str]) -> dict[str, int]:
 
 def _matrix(pred: list[str], actual: list[str]) -> dict[str, dict[str, int]]:
     return {
-        p: {a: sum(pp == p and aa == a for pp, aa in zip(pred, actual) for _ in [0]) for a in OUTCOME_CLASSES}
-        for p in OUTCOME_CLASSES
+        actual_label: {
+            predicted_label: sum(a == actual_label and p == predicted_label for p, a in zip(pred, actual))
+            for predicted_label in OUTCOME_CLASSES
+        }
+        for actual_label in OUTCOME_CLASSES
     }
 
 
 def _mean_distribution(rows: list[SnapshotFold], field: str = "probabilities_pct") -> dict[str, float]:
-    return {
-        label: float(np.mean([getattr(row, field)[label] for row in rows]))
-        for label in OUTCOME_CLASSES
-    }
+    return {label: float(np.mean([getattr(row, field)[label] for row in rows])) for label in OUTCOME_CLASSES}
 
 
 def _mean_baseline(rows: list[SnapshotFold]) -> dict[str, float]:
-    return {
-        label: float(np.mean([row.baseline_probabilities_pct[label] for row in rows]))
-        for label in OUTCOME_CLASSES
-    }
+    return {label: float(np.mean([row.baseline_probabilities_pct[label] for row in rows])) for label in OUTCOME_CLASSES}
 
 
 def _actual_distribution(rows: list[SnapshotFold]) -> dict[str, float]:
-    return {
-        label: sum(row.actual_class == label for row in rows) / len(rows) * 100.0
-        for label in OUTCOME_CLASSES
-    }
+    return {label: sum(row.actual_class == label for row in rows) / len(rows) * 100.0 for label in OUTCOME_CLASSES}
 
 
 def _group_name(row: SnapshotFold) -> str:
-    a = row.method_a_trend
-    b = row.method_b_trend
+    a, b = row.method_a_trend, row.method_b_trend
     if a and b:
         return "BOTH_AGREE" if a == b else "BOTH_CONFLICT"
     if a:
@@ -149,74 +142,132 @@ def _print_surface(title: str, rows: list[SnapshotFold]) -> None:
     print(f"  {title}: n={len(rows)}")
     for label in OUTCOME_CLASSES:
         print(
-            f"    {label:8s}: combined={mean[label]:6.2f}% "
-            f"baseline={baseline[label]:6.2f}% observed={observed[label]:6.2f}% "
-            f"bias={mean[label]-observed[label]:+6.2f}pp"
+            f"    {label:8s}: combined={mean[label]:6.2f}% baseline={baseline[label]:6.2f}% "
+            f"observed={observed[label]:6.2f}% bias={mean[label]-observed[label]:+6.2f}pp"
         )
     argmax = [max(OUTCOME_CLASSES, key=lambda label: row.probabilities_pct[label]) for row in rows]
     actual = [row.actual_class for row in rows]
     print(f"    argmax counts: {_class_counts(argmax)}")
     print(f"    argmax accuracy: {_accuracy(argmax, actual):.2f}%")
+    print(f"    confusion matrix (actual rows, predicted columns): {_matrix(argmax, actual)}")
+
+
+def _surface_status(present: int, total: int) -> str:
+    """Report partial availability accurately instead of treating it as absent."""
+    if present <= 0:
+        return "UNAVAILABLE"
+    if present < total:
+        return "PARTIAL"
+    return "COMPLETE"
 
 
 def _exact_method_surface_available(rows: list[SnapshotFold]) -> tuple[bool, bool]:
     return (
-        all(row.method_a_probabilities_pct is not None for row in rows),
-        all(row.method_b_probabilities_pct is not None for row in rows),
+        bool(rows) and all(row.method_a_probabilities_pct is not None for row in rows),
+        bool(rows) and all(row.method_b_probabilities_pct is not None for row in rows),
+    )
+
+
+def _print_combined_score_report(
+    rows: list[SnapshotFold],
+    *,
+    min_calibration_observations: int,
+    block_length: int,
+    bootstrap_replicates: int,
+) -> None:
+    dates = [row.prediction_date for row in rows]
+    ends = [row.outcome_end_date for row in rows]
+    actual = [row.actual_class for row in rows]
+    raw = [row.probabilities_pct for row in rows]
+    baseline = [row.baseline_probabilities_pct for row in rows]
+    calibration = calibrate_with_mature_labels(
+        dates, ends, actual, raw,
+        min_calibration_observations=min_calibration_observations,
+    )
+    calibrated = [item for item in calibration.probabilities_pct if item is not None]
+    print("Combined-model proper scoring (fold-stored baseline):")
+    print_score_line("raw combined", score_probabilities(actual, raw))
+    print_score_line("maturity-gated prequential calibrated", score_probabilities(actual, calibrated))
+    print_score_line("stored per-fold baseline", score_probabilities(actual, baseline))
+    print(f"  calibration statuses: {dict(Counter(calibration.statuses))}")
+    print(f"  mature training history sizes: min={min(calibration.mature_training_observations)}, "
+          f"median={float(np.median(calibration.mature_training_observations)):.1f}, "
+          f"max={max(calibration.mature_training_observations)}")
+    print_paired_comparison(
+        "raw combined versus stored baseline",
+        compare_probabilities_paired(
+            actual, raw, baseline,
+            block_length=block_length,
+            replicates=bootstrap_replicates,
+            seed=20261010,
+        ),
+    )
+    print_paired_comparison(
+        "calibrated combined versus stored baseline",
+        compare_probabilities_paired(
+            actual, calibrated, baseline,
+            block_length=block_length,
+            replicates=bootstrap_replicates,
+            seed=20261110,
+        ),
     )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Phase 6.2 read-only decomposition of the frozen Phase 5.8 probability surface "
-            "by Method A/B availability, agreement, conflict, and optional stored method vectors."
+            "Read-only Phase 6.2 decomposition of the frozen combined forecast by A/B availability, "
+            "agreement and conflict, with honest partial-vector status and scoring metrics."
         )
     )
     parser.add_argument("snapshot")
     parser.add_argument("--min-calibration-observations", type=int, default=30)
+    parser.add_argument("--block-length", type=int, default=5,
+                        help="Moving-block length in evaluated folds; test sensitivity at alternative values.")
+    parser.add_argument("--bootstrap-replicates", type=int, default=1000)
     args = parser.parse_args()
+    if args.block_length < 1 or args.bootstrap_replicates < 100:
+        parser.error("--block-length must be >=1 and --bootstrap-replicates must be >=100")
 
     rows = load_folds(args.snapshot)
     if not rows:
         raise RuntimeError("Snapshot contains no usable folds.")
 
-    calibrated = calibrate_phase5_folds(
-        rows,
-        min_calibration_observations=args.min_calibration_observations,
-    )
-    calibrated_by_date = {item.prediction_date: item for item in calibrated.predictions}
-
-    actual = [row.actual_class for row in rows]
-    raw_mean = _mean_distribution(rows)
-    baseline_mean = _mean_baseline(rows)
-    actual_freq = _actual_distribution(rows)
-    calibrated_mean = {
-        label: float(np.mean([calibrated_by_date[row.prediction_date].calibrated_probabilities_pct[label] for row in rows]))
-        for label in OUTCOME_CLASSES
+    groups: dict[str, list[SnapshotFold]] = {
+        name: [] for name in ("BOTH_AGREE", "BOTH_CONFLICT", "A_ONLY", "B_ONLY", "NEITHER")
     }
-
-    groups: dict[str, list[SnapshotFold]] = {name: [] for name in ("BOTH_AGREE", "BOTH_CONFLICT", "A_ONLY", "B_ONLY", "NEITHER")}
     for row in rows:
         groups[_group_name(row)].append(row)
 
-    a_exact, b_exact = _exact_method_surface_available(rows)
     a_present = sum(row.method_a_probabilities_pct is not None for row in rows)
     b_present = sum(row.method_b_probabilities_pct is not None for row in rows)
+    a_complete, b_complete = _exact_method_surface_available(rows)
 
     print("PHASE 6.2 METHOD-A/B PROBABILITY-SURFACE DECOMPOSITION")
     print(f"Snapshot: {args.snapshot}")
     print("Snapshot status: FROZEN")
     print(f"Folds: {len(rows)}")
+    print(f"Dates: {rows[0].prediction_date} through {rows[-1].prediction_date}")
     print("Protocol: FROZEN_PHASE5_8_METHOD_AVAILABILITY_AND_SURFACE_DECOMPOSITION")
+    print("Calibration protocol: PREQUENTIAL_ONLY_OUTCOMES_MATURED_BEFORE_PREDICTION")
+    print("")
+
+    _print_combined_score_report(
+        rows,
+        min_calibration_observations=args.min_calibration_observations,
+        block_length=args.block_length,
+        bootstrap_replicates=args.bootstrap_replicates,
+    )
 
     print("")
     print("Combined probability surface reference:")
+    raw_mean = _mean_distribution(rows)
+    baseline_mean = _mean_baseline(rows)
+    actual_freq = _actual_distribution(rows)
     for label in OUTCOME_CLASSES:
         print(
-            f"  {label:8s}: raw={raw_mean[label]:6.2f}% calibrated={calibrated_mean[label]:6.2f}% "
-            f"baseline={baseline_mean[label]:6.2f}% observed={actual_freq[label]:6.2f}% "
-            f"raw-bias={raw_mean[label]-actual_freq[label]:+6.2f}pp"
+            f"  {label:8s}: raw={raw_mean[label]:6.2f}% baseline={baseline_mean[label]:6.2f}% "
+            f"observed={actual_freq[label]:6.2f}% raw-bias={raw_mean[label]-actual_freq[label]:+6.2f}pp"
         )
 
     print("")
@@ -230,40 +281,32 @@ def main() -> None:
         group = groups[name]
         if not group:
             continue
-        a_preds = [row.method_a_trend for row in group if row.method_a_trend in OUTCOME_CLASSES]
-        a_actual = [row.actual_class for row in group if row.method_a_trend in OUTCOME_CLASSES]
-        b_preds = [row.method_b_trend for row in group if row.method_b_trend in OUTCOME_CLASSES]
-        b_actual = [row.actual_class for row in group if row.method_b_trend in OUTCOME_CLASSES]
+        a_rows = [row for row in group if row.method_a_trend in OUTCOME_CLASSES]
+        b_rows = [row for row in group if row.method_b_trend in OUTCOME_CLASSES]
         print(f"  {name}:")
-        if a_preds:
-            print(f"    Method A n={len(a_preds)} accuracy={_accuracy(a_preds, a_actual):.2f}% counts={_class_counts(a_preds)}")
-        if b_preds:
-            print(f"    Method B n={len(b_preds)} accuracy={_accuracy(b_preds, b_actual):.2f}% counts={_class_counts(b_preds)}")
+        if a_rows:
+            print(f"    Method A n={len(a_rows)} accuracy={_accuracy([row.method_a_trend for row in a_rows], [row.actual_class for row in a_rows]):.2f}% counts={_class_counts([row.method_a_trend for row in a_rows])}")
+        if b_rows:
+            print(f"    Method B n={len(b_rows)} accuracy={_accuracy([row.method_b_trend for row in b_rows], [row.actual_class for row in b_rows]):.2f}% counts={_class_counts([row.method_b_trend for row in b_rows])}")
 
     print("")
     print("Stored Method A/B probability vectors:")
-    print(f"  Method A vectors present: {a_present}/{len(rows)}")
-    print(f"  Method B vectors present: {b_present}/{len(rows)}")
-    if a_exact and b_exact:
-        print("  STATUS: exact method-level probability decomposition is available.")
-        for method_name, field in (("Method A", "method_a_probabilities_pct"), ("Method B", "method_b_probabilities_pct")):
-            method_rows = [row for row in rows if getattr(row, field) is not None]
-            mean = {
-                label: float(np.mean([getattr(row, field)[label] for row in method_rows]))
-                for label in OUTCOME_CLASSES
-            }
-            print(f"  {method_name} mean raw probabilities: {mean}")
+    print(f"  Method A: {a_present}/{len(rows)}; STATUS={_surface_status(a_present, len(rows))}")
+    print(f"  Method B: {b_present}/{len(rows)}; STATUS={_surface_status(b_present, len(rows))}")
+    if a_complete and b_complete:
+        print("  Exact method-level vectors are COMPLETE for both methods.")
+    elif a_present or b_present:
+        print("  Exact method-level vectors are PARTIALLY available; available vectors are still auditable.")
+        print("  Missing outputs remain missing and are not inferred from direction labels.")
     else:
-        print("  STATUS: exact method-level probability decomposition is NOT available in this snapshot.")
-        print("  REASON: Phase 5.8 snapshot v1 stores method trends but not fold-level Method A/B probabilities.")
-        print("  CONSEQUENCE: this audit will not infer Method A/B probabilities from trend labels.")
-        print("  ACTION: a future snapshot schema can retain those vectors; that would require a new Phase 5.8 snapshot.")
-
+        print("  Exact method-level vectors are UNAVAILABLE in this snapshot.")
+    print("  A missing method vector is distinct from an absent selected relationship; consult selection metadata for the reason.")
     print("")
     print("Interpretation guardrails:")
-    print("  - The grouped combined surfaces are descriptive and use only frozen Phase 5.8 fold outputs.")
-    print("  - Method trend availability identifies where each method contributed directionally, not its probability mass.")
-    print("  - No Phase 5.8 calculation, relationship search, threshold, or decision rule is changed.")
+    print("  - Grouped probability surfaces are descriptive, with subgroup sample sizes shown.")
+    print("  - The stored per-fold baseline is scored fold by fold, not replaced by realized aggregate frequencies.")
+    print("  - The moving-block interval is a dependence-aware uncertainty diagnostic; test sensitivity to block length.")
+    print("  - No Phase 5.8 calculation, relationship search, threshold or decision rule is recomputed.")
 
 
 if __name__ == "__main__":
