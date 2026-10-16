@@ -24,7 +24,7 @@ from app.services.catalog import (
     list_identifiers,
     metric_options,
 )
-from app.services.series_service import load_series
+from app.services.series_service import load_series, series_construction_note
 from app.services.statistics_service import (
     event_study,
     lead_lag_statistics,
@@ -57,12 +57,12 @@ FINANCIAL_SOURCE_LABELS = {
 }
 
 
-@st.cache_data(ttl=600, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def cached_identifiers(source: str) -> list[dict[str, str]]:
     return list_identifiers(source)
 
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def cached_series(source: str, identifier: str, metric: str, start_date: date) -> pd.DataFrame:
     return load_series(SeriesRequest(source, identifier, metric), start_date=start_date, end_date=None)
 
@@ -369,6 +369,44 @@ def main() -> None:
     primary_label = requested_main if requested_main in available else next(iter(available))
     if primary_label != requested_main:
         st.warning("The selected main variable has no observations in the loaded data. Using the first available series for this analysis.")
+    # Expose actual source coverage so a stale alias or lagging source is not
+    # mistaken for an intentionally selected historical chart window.
+    request_by_label = {_friendly_series_label(request): request for request in requests}
+    coverage_rows = []
+    daily_sources = {SOURCE_MARKET, SOURCE_MACRO, SOURCE_MATRIX, SOURCE_OPTIONS, SOURCE_BASIS, SOURCE_INSTITUTIONAL}
+    stale_sources = []
+    today_ts = pd.Timestamp(date.today())
+    for label, frame in available.items():
+        dates = pd.to_datetime(frame["date"], errors="coerce").dropna()
+        latest = dates.max() if not dates.empty else pd.NaT
+        first = dates.min() if not dates.empty else pd.NaT
+        visible_count = int(((frame["date"] >= pd.Timestamp(chart_start)) & (frame["date"] <= pd.Timestamp(chart_end))).sum())
+        request = request_by_label.get(label)
+        coverage_rows.append({
+            "Series": label,
+            "First loaded observation": first.date().isoformat() if pd.notna(first) else "Not available",
+            "Latest loaded observation": latest.date().isoformat() if pd.notna(latest) else "Not available",
+            "Rows loaded": len(frame),
+            "Rows in chart period": visible_count,
+        })
+        if request and request.source in daily_sources and pd.notna(latest):
+            age_days = (today_ts.normalize() - latest.normalize()).days
+            if age_days > 5:
+                stale_sources.append((label, latest.date().isoformat(), age_days))
+
+    with st.expander("Data coverage and how each series is built", expanded=bool(stale_sources)):
+        st.dataframe(pd.DataFrame(coverage_rows), use_container_width=True, hide_index=True)
+        for label in available:
+            request = request_by_label.get(label)
+            if request is not None:
+                st.caption(f"{label}: {series_construction_note(request)}")
+    if stale_sources:
+        stale_lines = "; ".join(f"{label} (latest {latest}, {age} days ago)" for label, latest, age in stale_sources)
+        st.warning(
+            "Some daily sources have no observations in the most recent five calendar days. "
+            "This may be a source-coverage gap or a stale ticker alias; check Data coverage before relying on the latest value. " + stale_lines
+        )
+
     primary = available[primary_label]
     primary_stats = variable_summary(primary, chart_start, chart_end)
     stat_cols = st.columns(4)

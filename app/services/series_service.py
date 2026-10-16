@@ -9,12 +9,12 @@ import pandas as pd
 from data_access.derivatives import get_futures_basis_history, get_options_history, get_unified_market_matrix
 from data_access.institutional import get_institutional_flow_history, get_institutional_history
 from data_access.macro_global import get_macro_history
-from data_access.market import get_daily_history
 
 from .catalog import (
     SOURCE_BASIS, SOURCE_INSTITUTIONAL, SOURCE_MACRO, SOURCE_MARKET,
     SOURCE_MATRIX, SOURCE_OPTIONS, FINANCIAL_METRICS, SeriesRequest, get_financial_loader,
 )
+from .market_series import load_freshest_market_history
 
 
 def _to_frame(table: Any) -> pd.DataFrame:
@@ -63,7 +63,7 @@ def load_series(
     metric = request.metric
 
     if source == SOURCE_MARKET:
-        frame = _to_frame(get_daily_history(identifier, start_date=start_date, end_date=end_date))
+        frame = _to_frame(load_freshest_market_history(identifier, start_date=start_date, end_date=end_date))
         result = _series_frame(frame, "report_date", metric, request.label)
     elif source == SOURCE_MACRO:
         frame = _to_frame(get_macro_history(identifier, start_date=start_date, end_date=end_date))
@@ -129,3 +129,44 @@ def load_series(
         result.attrs["label"] = request.label
         result.attrs["warning"] = "No numeric observations were returned for this series and date range."
     return result
+
+
+def series_construction_note(request: SeriesRequest) -> str:
+    """Explain in plain language how a plotted series is constructed."""
+    if request.source == SOURCE_MARKET:
+        return ("Market prices are loaded from the freshest available ticker alias "
+                "(canonical ticker or .NS variant). Check the data-coverage panel for the actual last observation.")
+    if request.source == SOURCE_MACRO:
+        return "This series comes directly from macro_daily_ledger for the selected indicator."
+    if request.source == SOURCE_MATRIX:
+        return ("This is an ETL-precomputed daily field from mv_unified_market_matrix; "
+                "the app plots the stored field rather than recalculating it.")
+    if request.source == SOURCE_OPTIONS:
+        if request.metric == "oi_pcr":
+            return ("Daily OI PCR = total put open interest divided by total call open interest, "
+                    "after summing expiry rows returned for the selected ticker and date.")
+        if request.metric == "volume_pcr":
+            return ("Daily volume PCR = total put volume divided by total call volume, "
+                    "after summing expiry rows returned for the selected ticker and date.")
+        return "Options quantities are summed across the returned expiry rows for each date."
+    if request.source == SOURCE_BASIS:
+        return ("One futures expiry is represented per date: the contract with the highest recorded open interest. "
+                "The chosen expiry can change over time, so the series can roll between contracts.")
+    if request.source == SOURCE_INSTITUTIONAL:
+        raw_metrics = {
+            "cash_buy_value", "cash_sell_value", "cash_net_value", "nifty_close",
+            "future_index_long", "future_index_short", "future_stock_long", "future_stock_short",
+            "option_index_call_long", "option_index_put_long", "option_index_call_short",
+            "option_index_put_short", "option_stock_call_long", "option_stock_put_long",
+            "option_stock_call_short", "option_stock_put_short", "total_long_contracts",
+            "total_short_contracts",
+        }
+        if request.metric in raw_metrics:
+            return ("This plots the selected raw institutional-ledger measure for the chosen client category. "
+                    "It is not an all-client total.")
+        return ("This plots a derived net-position/change field from mv_institutional_flow for the chosen "
+                "client category.")
+    if request.source in FINANCIAL_METRICS:
+        return ("Financial observations use accounting period-end ReportDate. That date is not assumed to be "
+                "the statement's public-release date.")
+    return "Values are plotted from the selected source and measure as returned by data_access."

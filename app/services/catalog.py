@@ -15,6 +15,7 @@ from data_access.financials import (
 from data_access.institutional import get_institutional_flow_history
 from data_access.macro_global import get_global_assets, get_macro_indicators
 from data_access.metadata import get_active_companies
+from data_access.query import execute_rows
 
 
 SOURCE_MARKET = "Market asset / company price"
@@ -106,9 +107,26 @@ BASIS_METRICS = [
 ]
 
 INSTITUTIONAL_METRICS = [
+    # Raw daily ledger fields.
     Metric("cash_buy_value", "Cash buy value"),
     Metric("cash_sell_value", "Cash sell value"),
     Metric("cash_net_value", "Net cash value"),
+    Metric("nifty_close", "Nifty close recorded in ledger"),
+    Metric("future_index_long", "Index futures long contracts"),
+    Metric("future_index_short", "Index futures short contracts"),
+    Metric("future_stock_long", "Stock futures long contracts"),
+    Metric("future_stock_short", "Stock futures short contracts"),
+    Metric("option_index_call_long", "Index call long contracts"),
+    Metric("option_index_put_long", "Index put long contracts"),
+    Metric("option_index_call_short", "Index call short contracts"),
+    Metric("option_index_put_short", "Index put short contracts"),
+    Metric("option_stock_call_long", "Stock call long contracts"),
+    Metric("option_stock_put_long", "Stock put long contracts"),
+    Metric("option_stock_call_short", "Stock call short contracts"),
+    Metric("option_stock_put_short", "Stock put short contracts"),
+    Metric("total_long_contracts", "Total long contracts"),
+    Metric("total_short_contracts", "Total short contracts"),
+    # Pre-derived net-position fields.
     Metric("future_index_net", "Index futures net"),
     Metric("future_index_net_change", "Index futures net change"),
     Metric("option_index_call_net", "Index call net"),
@@ -200,19 +218,51 @@ def list_identifiers(source: str) -> list[dict[str, str]]:
     if source == SOURCE_MACRO:
         return [{"value": item, "label": item} for item in get_macro_indicators()]
 
-    if source in (SOURCE_MARKET, SOURCE_MATRIX, SOURCE_OPTIONS, SOURCE_BASIS):
+    if source == SOURCE_MARKET:
+        # This source legitimately uses the general market asset catalogue.
         assets = get_global_assets()
-        seen: set[str] = set()
-        choices: list[dict[str, str]] = []
+        latest_by_ticker: dict[str, str] = {}
         for row in assets:
             ticker = str(row.get("ticker") or "").strip()
-            if not ticker or ticker in seen:
+            if not ticker:
                 continue
-            seen.add(ticker)
-            asset_class = str(row.get("asset_class") or "").strip()
-            label = f"{ticker} · {asset_class}" if asset_class else ticker
-            choices.append({"value": ticker, "label": label})
-        return sorted(choices, key=lambda row: row["label"].casefold())
+            latest = row.get("last_date")
+            latest_text = latest.isoformat() if hasattr(latest, "isoformat") else str(latest or "")
+            if ticker not in latest_by_ticker or latest_text > latest_by_ticker[ticker]:
+                latest_by_ticker[ticker] = latest_text
+        return [
+            {
+                "value": ticker,
+                "label": f"{ticker} · latest {latest}" if latest else ticker,
+            }
+            for ticker, latest in sorted(latest_by_ticker.items(), key=lambda item: item[0].casefold())
+        ]
+
+    # These selectors must be sourced from the same views that supply their
+    # plotted observations. Listing all global assets caused invalid choices
+    # for options, futures and the precomputed derivatives/microstructure view.
+    catalogue_queries = {
+        SOURCE_MATRIX: ("mv_unified_market_matrix", "date"),
+        SOURCE_OPTIONS: ("mv_options_aggregates", "ReportDate"),
+        SOURCE_BASIS: ("mv_spot_futures_basis", "ReportDate"),
+    }
+    if source in catalogue_queries:
+        table_name, date_column = catalogue_queries[source]
+        sql = (
+            f'SELECT ticker, MAX("{date_column}") AS latest_date '
+            f'FROM "{table_name}" WHERE ticker IS NOT NULL '
+            'GROUP BY ticker ORDER BY ticker'
+        )
+        rows = execute_rows(sql)
+        choices = []
+        for ticker, latest in rows:
+            ticker_text = str(ticker or "").strip()
+            if not ticker_text:
+                continue
+            latest_text = latest.isoformat() if hasattr(latest, "isoformat") else str(latest or "")
+            label = f"{ticker_text} · latest {latest_text}" if latest_text else ticker_text
+            choices.append({"value": ticker_text, "label": label})
+        return choices
 
     if source in FINANCIAL_METRICS:
         companies = get_active_companies()
