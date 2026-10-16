@@ -37,11 +37,11 @@ Changes are calculated first, then paired on exact matching observation dates. M
 - **OLS slope:** estimated average change in the Y-variable's measured change for a one-unit change in X's measured change. Its magnitude depends on the units and transformation.
 - **Scatter plot:** each point is a matched date; the line is a simple linear fit. Inspect outliers and curved patterns.
 - **Correlation heatmap:** Pearson correlations for selected pairs. Short two-line axis labels are used for space; hover a cell to see its full series name and matched count.
-- **Rolling correlation:** repeats the correlation over a moving window. The shaded interval is an approximate pointwise 95% Fisher-transformation interval for each window, assuming independent paired changes. Adjacent windows overlap, so this is not a simultaneous confidence band; serial dependence can make it too narrow. Sign changes can reflect true instability or sampling noise.
+- **Rolling correlation:** repeats the correlation over a moving window. Its interval uses a Fisher transformation with a Bartlett-style effective sample size that discounts some autocorrelation between the two change series. This is an approximation, not a complete dependence correction. Adjacent rolling windows overlap heavily, so pointwise bands are not simultaneous bands; non-stationarity and small windows can still mislead. Sign changes can reflect true instability or sampling noise.
 
 A rough magnitude convention may describe absolute Pearson values below 0.2 as very weak, 0.2–0.4 weak-to-modest, 0.4–0.6 moderate, 0.6–0.8 strong, and above 0.8 very strong. These are **not** universal thresholds, significance cutoffs or usefulness scores. Economic relevance and reliability require separate judgement and validation.
 
-The full-sample Pearson interval uses Fisher's transformation and assumes independent paired observations. Exact +/-1 correlations in very short samples are given the conservative full-range interval. Serial correlation, overlapping multi-observation changes, outliers and selecting among many pairs can make conventional intervals too optimistic.
+The full-sample Pearson interval uses Fisher's transformation with a Bartlett-style effective sample size estimated from autocorrelation at several short lags. This discounts some serial dependence, but it is only approximate: it does not fully handle non-stationarity, overlapping multi-observation changes, outliers, all forms of heteroskedasticity, or selecting among many variable pairs. Treat intervals as exploratory rather than final significance tests.
 
 ## Event response
 
@@ -56,9 +56,13 @@ The added difference graph focuses on the quantity of interest: event response m
 
 ## Lead/lag
 
-The graph shows correlation at each tested alignment. Negative lag means the comparison series is aligned earlier than the main variable under this app's convention; positive means later. Lag counts matched observations, not necessarily calendar days. The graph includes approximate pointwise Fisher intervals under an independent-pair assumption. They are **not** adjusted for serial dependence or the number of tested lags.
+The graph aligns measured changes at multiple offsets. Negative lag means the comparison series is aligned earlier than the main variable under this app's convention; positive means later. Offsets count exact matched observations, not necessarily calendar days or a guaranteed number of trading sessions.
 
-The y-axis zooms to the observed correlations and intervals by default to make small values readable. Enable the full-scale option for the complete −1 to +1 range. The strongest absolute correlation is selected from the lags tested, so it is biased upward by the search. A peak whose interval includes zero is not clearly distinguished from zero under the simplifying assumptions. Even an interval excluding zero is only a candidate when it is the maximum of many tested lags; confirm it on pre-specified periods or use a multiple-testing/dependence-aware procedure. Lead/lag correlation does not prove prediction or cause.
+For a selected change window of W observations, the app tests offsets spaced by W observations (for example, W=5 tests −10, −5, 0, +5, +10 when testing two windows in either direction). This reduces direct overlap between adjacent change windows, but it cannot eliminate serial dependence, regime changes, or timing irregularities in data with different frequencies or missing dates. The displayed offset and window length must be read together.
+
+Pointwise confidence intervals use a moving-block bootstrap of paired changes. This resamples contiguous blocks and approximately preserves local dependence; the block length is chosen from the data length and change window. Family-wise adjusted p-values come from a circular-shift maximum-statistic test: the comparison series is shifted relative to the primary series, shifts close to the tested offsets are excluded, and each observed lag is compared with the maximum absolute correlation across all tested lags under each shifted alignment. This helps account for choosing the strongest of the tested lags while preserving each series' broad serial structure approximately.
+
+The circular-shift test assumes the aligned change process is sufficiently stationary for shifts to be meaningful. It does not correct for testing many different variable pairs, windows, thresholds or study periods. The p-value can be unavailable for short samples or wide lag ranges; the app should say so instead of manufacturing a result. A peak that survives this test remains an association, not proof of prediction or cause. Confirm candidates on a pre-specified untouched chronological period.
 
 ## How to judge a result
 
@@ -70,4 +74,4 @@ Do not label a result good or bad from one coefficient. Inspect:
 4. **Stability:** does the relationship persist across dates and regimes?
 5. **Incremental value:** does it add information over an appropriate ordinary-response baseline?
 
-The current UI is exploratory. Formal claims of significance, causality or out-of-sample usefulness require stronger pre-specified validation than these descriptive plots alone.
+The current UI is exploratory. The lead/lag plot now uses non-overlapping tested offsets, moving-block-bootstrap intervals, and a circular-shift maximum-statistic p-value adjusted across the tested lags. Pair/rolling intervals use an approximate autocorrelation-based effective sample size; event-response differences use moving-block bootstrap intervals. None of these methods corrects all forms of dependence or all the other analyst choices. Cross-variable searches, repeated threshold/horizon tuning and chart interpretation still require pre-specified hypotheses, explicit multiple-testing control and confirmation on untouched chronological data before strong claims of statistical significance, causality or trading usefulness are justified.

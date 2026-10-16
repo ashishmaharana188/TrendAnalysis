@@ -11,6 +11,7 @@ from app.services.statistics_service import (
     distribution_interpretation,
     distribution_summary,
     event_study,
+    effective_sample_size_for_correlation,
     lead_lag_statistics,
     pair_statistics,
     paired_change_data,
@@ -93,10 +94,12 @@ class StatisticsServiceTests(unittest.TestCase):
         a = series([100, 101, 103, 102, 105, 107, 106, 109, 110, 112, 111, 114, 116, 115, 118])
         b = series([50, 50.5, 51.5, 51, 52.5, 53.5, 53, 54.5, 55, 56, 55.5, 57, 58, 57.5, 59])
         result = rolling_pair_correlation(a, b, window=1, rolling_observations=6)
-        valid = result.dropna(subset=["rolling_correlation"])
-        self.assertGreater(len(valid), 0)
+        self.assertGreater(result["rolling_correlation"].notna().sum(), 0)
         self.assertIn("rolling_ci_low", result.columns)
         self.assertIn("rolling_ci_high", result.columns)
+        # If effective sample size falls below 4, the interval is deliberately omitted.
+        valid = result.dropna(subset=["rolling_correlation", "rolling_ci_low", "rolling_ci_high"])
+        self.assertGreater(len(valid), 0)
         self.assertTrue((valid["rolling_ci_low"] <= valid["rolling_correlation"]).all())
         self.assertTrue((valid["rolling_ci_high"] >= valid["rolling_correlation"]).all())
 
@@ -132,6 +135,58 @@ class StatisticsServiceTests(unittest.TestCase):
         self.assertGreater(len(populated), 0)
         self.assertTrue((populated["block_bootstrap_difference_ci_low"] <= populated["mean_difference_vs_baseline"]).all())
         self.assertTrue((populated["block_bootstrap_difference_ci_high"] >= populated["mean_difference_vs_baseline"]).all())
+
+    def test_lead_lag_offsets_are_spaced_by_full_change_window(self):
+        import numpy as np
+        rng = np.random.default_rng(2026)
+        n = 180
+        x_steps = rng.normal(0.0, 1.0, n)
+        y_steps = rng.normal(0.0, 1.0, n)
+        x = pd.DataFrame({"date": pd.date_range("2024-01-01", periods=n, freq="D"), "value": 500 + np.cumsum(x_steps)})
+        y = pd.DataFrame({"date": pd.date_range("2024-01-01", periods=n, freq="D"), "value": 800 + np.cumsum(y_steps)})
+        result = lead_lag_statistics(x, y, window=3, mode="diff", max_lag=2, bootstrap_replicates=50, permutations=30)
+        self.assertEqual(result["lag_windows"].tolist(), [-2, -1, 0, 1, 2])
+        self.assertEqual(result["lag_observations"].tolist(), [-6, -3, 0, 3, 6])
+        self.assertTrue((result["lag_observations"].abs() % 3 == 0).all())
+
+    def test_lead_lag_returns_familywise_shift_p_values_when_sample_supports_it(self):
+        import numpy as np
+        rng = np.random.default_rng(733)
+        n = 240
+        x_steps = rng.normal(0.0, 1.0, n)
+        y_steps = np.roll(x_steps, 3) + rng.normal(0.0, 0.5, n)
+        x = pd.DataFrame({"date": pd.date_range("2024-01-01", periods=n, freq="D"), "value": 500 + np.cumsum(x_steps)})
+        y = pd.DataFrame({"date": pd.date_range("2024-01-01", periods=n, freq="D"), "value": 800 + np.cumsum(y_steps)})
+        result = lead_lag_statistics(x, y, window=1, mode="diff", max_lag=5, bootstrap_replicates=60, permutations=50)
+        self.assertIn("familywise_adjusted_p_value", result.columns)
+        self.assertTrue(result["familywise_adjusted_p_value"].dropna().between(0, 1).all())
+        self.assertTrue((result["null_shift_replicates"] > 0).all())
+        self.assertTrue(result["ci_low"].notna().any())
+        peak = result.loc[result["correlation"].abs().idxmax()]
+        self.assertEqual(int(peak["lag_observations"]), 3)
+
+    def test_lag_bootstrap_interval_is_unavailable_when_lag_span_is_too_wide(self):
+        import numpy as np
+        n = 120
+        rng = np.random.default_rng(88)
+        a = pd.DataFrame({"date": pd.date_range("2024-01-01", periods=n, freq="D"), "value": 100 + np.cumsum(rng.normal(size=n))})
+        b = pd.DataFrame({"date": pd.date_range("2024-01-01", periods=n, freq="D"), "value": 300 + np.cumsum(rng.normal(size=n))})
+        result = lead_lag_statistics(a, b, window=10, mode="diff", max_lag=5, bootstrap_replicates=50, permutations=30)
+        self.assertTrue(result["ci_low"].isna().all())
+        self.assertTrue(result["bootstrap_block_length"].isna().all())
+
+    def test_effective_sample_size_discounts_serial_dependence(self):
+        import numpy as np
+        rng = np.random.default_rng(1002)
+        n = 200
+        x = np.zeros(n)
+        y = np.zeros(n)
+        for i in range(1, n):
+            x[i] = 0.9 * x[i - 1] + rng.normal()
+            y[i] = 0.9 * y[i - 1] + rng.normal()
+        effective = effective_sample_size_for_correlation(x, y)
+        self.assertGreaterEqual(effective, 1)
+        self.assertLess(effective, n)
 
     def test_distribution_modes_are_independent_of_series_units(self):
         prices = series([100, 105, 103, 110, 111])

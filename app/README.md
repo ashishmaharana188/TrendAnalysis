@@ -118,10 +118,10 @@ All navigation is handled in the browser iframe. Date-range changes are applied 
 ## Statistical interpretation improvements (v13)
 
 - Relationship heatmap axis labels are shortened into readable two-line labels; hovering still exposes the full series names and matched-observation count.
-- Rolling-correlation charts show approximate pointwise Fisher intervals. Because windows overlap and observations can be serially dependent, the bands are indicative rather than simultaneous/dependence-robust intervals.
+- Pairwise and rolling-correlation intervals use a Bartlett-style effective sample size to discount some autocorrelation. These intervals are approximations, not complete corrections for non-stationarity, outliers, or multiple comparisons.
 - Event studies include a separate event-minus-baseline graph. Its uncertainty intervals use a circular moving-block bootstrap over the chronological matched-observation sequence to preserve some local dependence and overlapping forward-horizon effects. The intervals are still exploratory and are not corrected for selecting multiple thresholds/horizons.
 - Event interpretation is based on a user-selected horizon and event direction, rather than automatically highlighting whichever tested combination has the largest difference. This helps avoid presenting the maximum selected result as if it had been specified in advance.
-- Lead/lag results include approximate pointwise intervals, an observed-range y-axis for readability, a switch for the full -1 to +1 correlation range, and interpretation that accounts for the peak having been selected across multiple lags.
+- Lead/lag offsets are spaced by a full change-formation window, reducing direct overlap between adjacent tested change intervals. Confidence intervals use a moving-block bootstrap of paired changes; family-wise adjusted p-values use a circular-shift maximum-statistic test across the tested offsets. These results assume a sufficiently stationary change process and do not correct searches across multiple variables, windows or study periods.
 
 ## Full app test command
 
@@ -129,4 +129,13 @@ All navigation is handled in the browser iframe. Date-range changes are applied 
 python -m unittest app.tests.test_statistics_service app.tests.test_time_ranges app.tests.test_charts app.tests.test_indicators -v
 ```
 
-The statistical interval methods are deliberately labelled approximate. They help interpret the evidence, but do not by themselves establish causation, eliminate selection bias or replace a pre-specified out-of-sample validation.
+The statistical interval methods are deliberately labelled approximate. The lead/lag procedure controls selection over the tested offsets under a circular-shift/stationarity assumption, but does not correct for trying multiple series, windows or periods. These methods do not establish causation or replace pre-specified validation on untouched chronological data.
+
+
+## Statistical validity updates (v14)
+
+- Lead/lag shifts comparison returns only at multiples of the selected change window. For example, a 5-observation formation window tests offsets 0, ±5, ±10, etc., rather than every overlapping daily shift. Offsets are counts of exact matched observations, not guaranteed calendar days.
+- Lead/lag confidence intervals use a moving-block bootstrap of the paired change sequence. Family-wise adjusted p-values compare each observed correlation with the maximum absolute correlation across all tested offsets in circular-shift null samples. If the study is too short relative to the offset range, the app reports that the inferential test is unavailable.
+- Pairwise and rolling correlations now use a Bartlett-style effective sample size estimated from autocorrelation products across short lags, extending the range to reflect overlapping return windows when enough observations exist. This is an approximate adjustment, not an exact correction.
+- Event analysis distinguishes the primary-variable formation window from the target response horizon and warns that trying multiple thresholds/horizons and then selecting a favourable result is a multiple-testing problem.
+- The scatter view provides a table of unusual matched observations based on robust median/MAD deviations. These points are flagged for inspection, never silently removed.

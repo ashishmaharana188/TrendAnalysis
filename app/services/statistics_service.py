@@ -66,8 +66,8 @@ def paired_change_data(
     return _date_filter(joined, start_date, end_date).reset_index(drop=True)
 
 
-def _fisher_correlation_interval(r: float | None, n: int) -> tuple[float | None, float | None]:
-    """Approximate Fisher-z 95% interval; assumes independent paired observations."""
+def _fisher_correlation_interval(r: float | None, n: float) -> tuple[float | None, float | None]:
+    """Approximate Fisher-z 95% interval using the supplied effective sample size."""
     if r is None or n < 4 or not np.isfinite(r):
         return None, None
     # Exact +/-1 correlations in short windows make Fisher z infinite. Return a
@@ -78,6 +78,57 @@ def _fisher_correlation_interval(r: float | None, n: int) -> tuple[float | None,
     z = atanh(clipped)
     margin = 1.96 / sqrt(n - 3)
     return tanh(z - margin), tanh(z + margin)
+
+
+def _safe_corr(x: np.ndarray, y: np.ndarray) -> float | None:
+    """Pearson correlation for finite arrays without pandas overhead."""
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    valid = np.isfinite(x) & np.isfinite(y)
+    x, y = x[valid], y[valid]
+    if len(x) < 3:
+        return None
+    xc = x - np.mean(x)
+    yc = y - np.mean(y)
+    denom = float(np.sqrt(np.dot(xc, xc) * np.dot(yc, yc)))
+    if denom <= 0 or not np.isfinite(denom):
+        return None
+    return float(np.clip(np.dot(xc, yc) / denom, -1.0, 1.0))
+
+
+def _acf_at_lag(values: np.ndarray, lag: int) -> float:
+    values = np.asarray(values, dtype=float)
+    if lag <= 0 or len(values) <= lag + 2:
+        return 0.0
+    return _safe_corr(values[:-lag], values[lag:]) or 0.0
+
+
+def effective_sample_size_for_correlation(
+    x: np.ndarray,
+    y: np.ndarray,
+    max_acf_lag: int | None = None,
+) -> float:
+    """Bartlett-style effective sample-size approximation for serially dependent pairs.
+
+    It discounts nominal sample size when both series have positive serial dependence.
+    This is an approximation for uncertainty guidance, not an exact correction for
+    arbitrary non-stationarity, overlapping returns, or selection across many pairs.
+    """
+    x = np.asarray(x, dtype=float)
+    y = np.asarray(y, dtype=float)
+    valid = np.isfinite(x) & np.isfinite(y)
+    x, y = x[valid], y[valid]
+    n = int(min(len(x), len(y)))
+    if n < 4:
+        return float(n)
+    k_max = min(max_acf_lag if max_acf_lag is not None else min(10, n // 4), n // 4)
+    denominator = 1.0
+    for lag in range(1, max(0, k_max) + 1):
+        taper = 1.0 - lag / (k_max + 1.0) if k_max >= 1 else 0.0
+        denominator += 2.0 * taper * _acf_at_lag(x, lag) * _acf_at_lag(y, lag)
+    if not np.isfinite(denominator) or denominator <= 0:
+        return float(n)
+    return float(np.clip(n / denominator, 1.0, float(n)))
 
 
 def pair_statistics(
@@ -91,22 +142,23 @@ def pair_statistics(
     joined = paired_change_data(primary, comparison, window, mode, start_date, end_date)
     n = int(len(joined))
     if n < 2:
-        return {"observations": n, "pearson": None, "spearman": None, "slope": None, "pearson_ci_low": None, "pearson_ci_high": None}
+        return {"observations": n, "effective_observations": float(n), "pearson": None, "spearman": None, "slope": None, "pearson_ci_low": None, "pearson_ci_high": None}
     x = joined["primary_change"].to_numpy(dtype=float)
     y = joined["comparison_change"].to_numpy(dtype=float)
-    pearson = float(np.corrcoef(x, y)[0, 1]) if np.std(x) > 0 and np.std(y) > 0 else None
+    pearson = _safe_corr(x, y)
     spearman = joined["primary_change"].corr(joined["comparison_change"], method="spearman")
     slope = float(np.polyfit(x, y, 1)[0]) if np.std(x) > 0 else None
-    ci_low, ci_high = _fisher_correlation_interval(pearson, n)
+    effective_n = effective_sample_size_for_correlation(x, y, max_acf_lag=min(max(10, window - 1), n // 4))
+    ci_low, ci_high = _fisher_correlation_interval(pearson, effective_n)
     return {
         "observations": n,
-        "pearson": pearson if pearson is None or np.isfinite(pearson) else None,
+        "effective_observations": effective_n,
+        "pearson": pearson,
         "spearman": float(spearman) if pd.notna(spearman) else None,
         "slope": slope if slope is None or np.isfinite(slope) else None,
         "pearson_ci_low": ci_low,
         "pearson_ci_high": ci_high,
     }
-
 
 def correlation_matrix(
     series: Mapping[str, pd.DataFrame],
@@ -145,24 +197,137 @@ def rolling_pair_correlation(
     start_date=None,
     end_date=None,
 ) -> pd.DataFrame:
-    """Rolling Pearson correlation with an approximate per-window Fisher interval.
+    """Rolling Pearson correlation with a Bartlett-effective-n Fisher interval.
 
-    The interval assumes independent paired observations within each window.
-    Rolling windows overlap, so the bands are pointwise/approximate, not a
-    simultaneous confidence band and not robust to serial dependence.
+    The effective-n adjustment accounts approximately for serial dependence in each
+    rolling window. Bands remain pointwise and overlapping windows are not independent.
     """
     if rolling_observations < 4:
         raise ValueError("rolling_observations must be >= 4")
     joined = paired_change_data(primary, comparison, window, mode, start_date, end_date)
-    joined["rolling_correlation"] = joined["primary_change"].rolling(rolling_observations, min_periods=rolling_observations).corr(joined["comparison_change"]).clip(-1.0, 1.0)
-    intervals = joined["rolling_correlation"].map(
-        lambda value: _fisher_correlation_interval(float(value), rolling_observations)
-        if pd.notna(value) else (None, None)
-    )
-    joined["rolling_ci_low"] = [pair[0] for pair in intervals]
-    joined["rolling_ci_high"] = [pair[1] for pair in intervals]
+    x_all = joined["primary_change"].to_numpy(dtype=float)
+    y_all = joined["comparison_change"].to_numpy(dtype=float)
+    corr_values: list[float | None] = []
+    ci_lows: list[float | None] = []
+    ci_highs: list[float | None] = []
+    effective_ns: list[float | None] = []
+    for end in range(len(joined)):
+        begin = end - rolling_observations + 1
+        if begin < 0:
+            corr_values.append(None); ci_lows.append(None); ci_highs.append(None); effective_ns.append(None)
+            continue
+        x = x_all[begin:end + 1]
+        y = y_all[begin:end + 1]
+        corr = _safe_corr(x, y)
+        eff_n = effective_sample_size_for_correlation(x, y, max_acf_lag=min(max(10, window - 1), rolling_observations // 4))
+        low, high = _fisher_correlation_interval(corr, eff_n)
+        corr_values.append(corr); ci_lows.append(low); ci_highs.append(high); effective_ns.append(eff_n)
+    joined["rolling_correlation"] = corr_values
+    joined["rolling_ci_low"] = ci_lows
+    joined["rolling_ci_high"] = ci_highs
+    joined["effective_observations"] = effective_ns
     joined["rolling_observations"] = rolling_observations
-    return joined[["date", "rolling_correlation", "rolling_ci_low", "rolling_ci_high", "rolling_observations"]]
+    return joined[["date", "rolling_correlation", "rolling_ci_low", "rolling_ci_high", "rolling_observations", "effective_observations"]]
+
+def _corr_for_offset(x: np.ndarray, y: np.ndarray, offset: int) -> tuple[float | None, int]:
+    """Align x[t] with y[t+offset]; positive offset means y is later."""
+    n = min(len(x), len(y))
+    if abs(offset) >= n - 2:
+        return None, 0
+    if offset > 0:
+        xa, ya = x[:n - offset], y[offset:n]
+    elif offset < 0:
+        xa, ya = x[-offset:n], y[:n + offset]
+    else:
+        xa, ya = x[:n], y[:n]
+    valid = np.isfinite(xa) & np.isfinite(ya)
+    xa, ya = xa[valid], ya[valid]
+    return _safe_corr(xa, ya), int(len(xa))
+
+
+def _moving_block_lag_intervals(
+    x: np.ndarray,
+    y: np.ndarray,
+    offsets: list[int],
+    window: int,
+    replicates: int = 199,
+) -> tuple[dict[int, tuple[float | None, float | None]], int | None]:
+    """Moving-block bootstrap intervals for lag correlations; resamples paired blocks."""
+    n = len(x)
+    # A lagged correlation depends on paired observations separated by the largest
+    # tested offset. Blocks shorter than that split the relevant pair across artificial
+    # block seams and can badly bias its bootstrap distribution. Require at least three
+    # blocks that cover the full lag span plus the change window.
+    required_block = max((abs(int(offset)) for offset in offsets), default=0) + int(window)
+    if n < max(30, 3 * required_block) or replicates < 50:
+        return {offset: (None, None) for offset in offsets}, None
+    proposed = max(required_block, int(np.ceil(n ** (1.0 / 3.0))), 2)
+    block_length = min(proposed, max(2, n // 3))
+    blocks_needed = int(np.ceil(n / block_length))
+    rng = np.random.default_rng(20261016 + n + window + max(offsets or [0]))
+    collected: dict[int, list[float]] = {offset: [] for offset in offsets}
+    for _ in range(replicates):
+        starts = rng.integers(0, n, size=blocks_needed)
+        indices = np.concatenate([(np.arange(start, start + block_length) % n) for start in starts])[:n]
+        xb, yb = x[indices], y[indices]
+        for offset in offsets:
+            corr, _ = _corr_for_offset(xb, yb, offset)
+            if corr is not None and np.isfinite(corr):
+                collected[offset].append(corr)
+    intervals: dict[int, tuple[float | None, float | None]] = {}
+    for offset, samples in collected.items():
+        if len(samples) >= max(50, int(replicates * 0.5)):
+            intervals[offset] = (float(np.quantile(samples, 0.025)), float(np.quantile(samples, 0.975)))
+        else:
+            intervals[offset] = (None, None)
+    return intervals, block_length
+
+
+def _circular_shift_maxstat_pvalues(
+    x: np.ndarray,
+    y: np.ndarray,
+    offsets: list[int],
+    permutations: int = 399,
+) -> tuple[dict[int, float | None], int]:
+    """Family-wise p-values from a circular-shift max-statistic null.
+
+    A circular shift preserves each series' broad autocorrelation structure while
+    breaking its original alignment. Shifts close to the tested lag range are excluded.
+    The procedure assumes the aligned change process is sufficiently stationary for
+    circular shifts to be meaningful; it is exploratory, not causal identification.
+    """
+    n = min(len(x), len(y))
+    max_offset = max((abs(value) for value in offsets), default=0)
+    exclusion = max_offset + 1
+    candidates = np.arange(exclusion + 1, n - exclusion, dtype=int)
+    if len(candidates) < 20 or permutations < 20:
+        return {offset: None for offset in offsets}, 0
+    rng = np.random.default_rng(20261017 + n + max_offset)
+    count = min(int(permutations), len(candidates))
+    shifts = rng.choice(candidates, size=count, replace=False)
+    null_maxima: list[float] = []
+    for shift in shifts:
+        shifted_y = np.roll(y, int(shift))
+        magnitudes: list[float] = []
+        for offset in offsets:
+            corr, _ = _corr_for_offset(x, shifted_y, offset)
+            if corr is not None and np.isfinite(corr):
+                magnitudes.append(abs(corr))
+        if magnitudes:
+            null_maxima.append(max(magnitudes))
+    if not null_maxima:
+        return {offset: None for offset in offsets}, 0
+    null = np.asarray(null_maxima, dtype=float)
+    adjusted: dict[int, float | None] = {}
+    for offset in offsets:
+        corr, _ = _corr_for_offset(x, y, offset)
+        if corr is None:
+            adjusted[offset] = None
+        else:
+            # Comparing every lag to the maximum null statistic controls selection
+            # of the strongest lag over the tested family (family-wise, conservative).
+            adjusted[offset] = float((1 + np.count_nonzero(null >= abs(corr))) / (len(null) + 1))
+    return adjusted, len(null)
 
 
 def lead_lag_statistics(
@@ -173,34 +338,53 @@ def lead_lag_statistics(
     max_lag: int = 10,
     start_date=None,
     end_date=None,
+    bootstrap_replicates: int = 199,
+    permutations: int = 399,
 ) -> pd.DataFrame:
-    """Correlation for every tested alignment, with approximate Fisher intervals."""
+    """Lead/lag correlation using non-overlapping return-window offsets.
+
+    `max_lag` means the number of change windows to test in either direction. If
+    window=5 and max_lag=3, tested offsets are -15,-10,-5,0,+5,+10,+15 matched
+    observations. Each adjacent tested alignment is shifted by a full change window,
+    avoiding overlap between the primary and comparison change intervals. This helps
+    with interval overlap but does not eliminate autocorrelation or nonstationarity.
+
+    CIs use moving-block bootstrap intervals. Family-wise adjusted p-values compare
+    each observed lag to the maximum absolute correlation across lags under circular
+    shifts of the comparison series, preserving serial structure approximately.
+    """
     if max_lag < 0:
         raise ValueError("max_lag must be >= 0")
+    if window < 1:
+        raise ValueError("window must be >= 1")
     p = change_series(primary, window, mode).rename(columns={"change": "primary_change"})
     c = change_series(comparison, window, mode).rename(columns={"change": "comparison_change"})
     joined = p.merge(c, on="date", how="inner").sort_values("date").reset_index(drop=True)
-    joined = _date_filter(joined, start_date, end_date).reset_index(drop=True)
+    joined = _date_filter(joined, start_date, end_date).dropna(subset=["primary_change", "comparison_change"]).reset_index(drop=True)
+    x = joined["primary_change"].to_numpy(dtype=float)
+    y = joined["comparison_change"].to_numpy(dtype=float)
+    lag_windows = list(range(-max_lag, max_lag + 1))
+    offsets = [step * window for step in lag_windows]
+    boot_ci, block_length = _moving_block_lag_intervals(x, y, offsets, window, bootstrap_replicates)
+    adjusted_p, null_count = _circular_shift_maxstat_pvalues(x, y, offsets, permutations)
     records = []
-    for lag in range(-max_lag, max_lag + 1):
-        # Positive lag means the comparison-series change is later than the primary change.
-        shifted = joined["comparison_change"].shift(-lag)
-        valid = pd.DataFrame({"x": joined["primary_change"], "y": shifted}).dropna()
-        n = len(valid)
-        corr = None
-        if n >= 3 and valid["x"].std() > 0 and valid["y"].std() > 0:
-            candidate = valid["x"].corr(valid["y"])
-            corr = float(candidate) if pd.notna(candidate) else None
-        ci_low, ci_high = _fisher_correlation_interval(corr, n)
+    for step, offset in zip(lag_windows, offsets):
+        corr, n = _corr_for_offset(x, y, offset)
+        ci_low, ci_high = boot_ci.get(offset, (None, None))
         records.append({
-            "lag_observations": lag,
+            "lag_windows": step,
+            "lag_observations": offset,
             "correlation": corr,
             "ci_low": ci_low,
             "ci_high": ci_high,
             "observations": int(n),
+            "familywise_adjusted_p_value": adjusted_p.get(offset),
+            "tested_lags_count": len(offsets),
+            "null_shift_replicates": null_count,
+            "bootstrap_block_length": block_length,
+            "change_window_observations": window,
         })
     return pd.DataFrame(records)
-
 
 def _future_response(frame: pd.DataFrame, horizon: int, mode: str) -> pd.DataFrame:
     out = normalize_series(frame)

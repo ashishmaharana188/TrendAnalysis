@@ -715,7 +715,7 @@ def main() -> None:
                 )
                 if not corr_matrix.empty:
                     st.markdown("**Across-variable relationship map**")
-                    st.caption("Each cell is Pearson correlation between the selected changes. Each pair uses only exact matching dates; hover a cell to see its matched count.")
+                    st.caption(f"Each cell is Pearson correlation between {window}-observation {'percentage changes' if transform == 'pct' else 'absolute changes'}. Each pair uses exact matching dates; hover a cell to see its matched count. Multi-observation changes overlap through time, so use this heatmap descriptively.")
                     full_labels = list(corr_matrix.columns)
                     short_labels = [_heatmap_tick_label(label) for label in full_labels]
                     heat = go.Figure(data=go.Heatmap(
@@ -749,14 +749,16 @@ def main() -> None:
                     pair_y_label = st.selectbox("Second variable (Y-axis)", pair_y_options, index=0, key="pair_y_label_v11")
                 result = pair_statistics(available[pair_x_label], available[pair_y_label], int(window), transform, analysis_start, analysis_end)
                 paired = paired_change_data(available[pair_x_label], available[pair_y_label], int(window), transform, analysis_start, analysis_end)
-                mcols = st.columns(4)
+                mcols = st.columns(5)
                 mcols[0].metric("Matched observations", str(result["observations"]))
-                mcols[1].metric("Pearson r", _format_value(result["pearson"]))
-                mcols[2].metric("Spearman ρ", _format_value(result["spearman"]))
+                mcols[1].metric("Effective observations*", _format_value(result.get("effective_observations")))
+                mcols[2].metric("Pearson r", _format_value(result["pearson"]))
+                mcols[3].metric("Spearman ρ", _format_value(result["spearman"]))
                 ci_text = "Unavailable"
                 if result.get("pearson_ci_low") is not None and result.get("pearson_ci_high") is not None:
                     ci_text = f"{result['pearson_ci_low']:.2f} to {result['pearson_ci_high']:.2f}"
-                mcols[3].metric("Approx. 95% interval for r", ci_text)
+                mcols[4].metric("Approx. 95% interval for r", ci_text)
+                st.caption("*Effective observations are a Bartlett-style approximation that discounts some serial dependence. They are not an exact sample size and cannot by themselves correct for non-stationarity, outliers, overlapping changes or trying many variable pairs.")
                 if len(paired) >= 2:
                     x, y = paired["primary_change"], paired["comparison_change"]
                     scatter = go.Figure()
@@ -772,18 +774,36 @@ def main() -> None:
                         if slope is not None and intercept is not None:
                             xline = np.linspace(float(np.min(x)), float(np.max(x)), 80)
                             scatter.add_trace(go.Scatter(x=xline, y=intercept + slope * xline, mode="lines", name="Linear fit", line={"color": "#F59E0B", "width": 2}))
+                    change_unit = "percentage change (%)" if transform == "pct" else "absolute change"
                     scatter.update_layout(
-                        title="Same-period changes: each point is one matched date",
-                        height=400, margin={"l": 55, "r": 20, "t": 55, "b": 60},
+                        title=f"Same-period changes · {window}-observation window · one point per matched date",
+                        height=420, margin={"l": 65, "r": 25, "t": 60, "b": 75},
                         paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
                         font={"color": "#D9E2F0", "size": 11},
-                        xaxis_title=f"{pair_x_label} · {'percentage change (%)' if transform == 'pct' else 'absolute change'}",
-                        yaxis_title=f"{pair_y_label} · {'percentage change (%)' if transform == 'pct' else 'absolute change'}",
+                        xaxis_title=f"{pair_x_label} · {window}-observation {change_unit}",
+                        yaxis_title=f"{pair_y_label} · {window}-observation {change_unit}",
                         legend={"orientation": "h", "y": 1.08},
                     )
                     scatter.update_xaxes(gridcolor="rgba(154, 167, 186, 0.16)", zeroline=True)
                     scatter.update_yaxes(gridcolor="rgba(154, 167, 186, 0.16)", zeroline=True)
                     st.plotly_chart(scatter, use_container_width=True, theme=None, config={"displaylogo": False})
+                    with st.expander("Inspect unusual matched observations", expanded=False):
+                        outlier_view = paired[["date", "primary_change", "comparison_change"]].copy()
+                        def _robust_z(series: pd.Series) -> pd.Series:
+                            median = float(series.median())
+                            mad = float((series - median).abs().median())
+                            scale = 1.4826 * mad
+                            if not np.isfinite(scale) or scale == 0:
+                                scale = float(series.std(ddof=1)) if len(series) > 1 else 0.0
+                            return (series - median) / scale if scale > 0 else pd.Series(0.0, index=series.index)
+                        outlier_view["X robust deviation"] = _robust_z(outlier_view["primary_change"])
+                        outlier_view["Y robust deviation"] = _robust_z(outlier_view["comparison_change"])
+                        outlier_view["Combined deviation"] = np.sqrt(outlier_view["X robust deviation"] ** 2 + outlier_view["Y robust deviation"] ** 2)
+                        outlier_view = outlier_view.sort_values("Combined deviation", ascending=False).head(10)
+                        outlier_view["date"] = pd.to_datetime(outlier_view["date"]).dt.date.astype(str)
+                        outlier_view = outlier_view.rename(columns={"date": "Date", "primary_change": f"{pair_x_label} change", "comparison_change": f"{pair_y_label} change"})
+                        st.dataframe(outlier_view, use_container_width=True, hide_index=True)
+                        st.caption("These are the 10 most unusual paired points by a median/MAD-based deviation score. They are flagged for inspection, not automatically removed or classified as data errors. Review the dates and raw observations before deciding how they should be handled.")
 
                     if result["pearson"] is not None:
                         magnitude = abs(float(result["pearson"]))
@@ -804,10 +824,12 @@ def main() -> None:
                     elif result["observations"] < 30:
                         st.warning(f"Only {result['observations']} matched observations: treat the estimated relationship as tentative.")
                     elif result.get("pearson_ci_low") is not None and result["pearson_ci_low"] <= 0 <= result["pearson_ci_high"]:
-                        st.info("The approximate interval for Pearson correlation includes zero under a simplified independent-observation assumption. This does not prove the relationship is absent.")
+                        st.info("The approximate autocorrelation-adjusted interval for Pearson correlation includes zero. The estimate does not clearly distinguish this sample's linear association from zero; this does not prove the relationship is absent.")
                     elif result.get("pearson_ci_low") is not None:
-                        st.info("The approximate interval does not include zero under a simplified independent-observation assumption. This is still exploratory; serial dependence, outliers and selection across many variable pairs can overstate certainty.")
-                    st.caption("The shaded/approximate 95% interval uses Fisher's transformation and assumes independent paired observations. Daily returns may be autocorrelated, and overlapping multi-observation changes are dependent; use the interval as a rough guide, not a final significance test.")
+                        st.info("The approximate autocorrelation-adjusted interval does not include zero in this sample. This is still exploratory: the adjustment is approximate and does not correct for outliers, non-stationarity, or selection across many variable pairs.")
+                    else:
+                        st.warning("A correlation interval is not shown because the estimated effective sample size is too small for a useful Fisher interval after discounting serial dependence. The raw correlation remains descriptive only.")
+                    st.caption("The approximate 95% interval uses Fisher's transformation with a Bartlett-style effective sample size based on autocorrelation across several lags, including more lags for overlapping multi-observation changes where sample support permits. This is a rough dependence adjustment, not a complete time-series inferential procedure; the interval is not adjusted for selecting many variable pairs.")
 
                     rolling = rolling_pair_correlation(
                         available[pair_x_label], available[pair_y_label], int(window), transform,
@@ -830,15 +852,15 @@ def main() -> None:
                         roll_fig.add_trace(go.Scatter(
                             x=rolling["date"], y=rolling["rolling_correlation"], mode="lines",
                             name="Rolling Pearson r", line={"color": "#A78BFA", "width": 2},
-                            customdata=np.column_stack([ci_low, ci_high, rolling["rolling_observations"]]),
-                            hovertemplate="Date: %{x|%Y-%m-%d}<br>Rolling r: %{y:.3f}<br>Approx. interval: %{customdata[0]:.3f} to %{customdata[1]:.3f}<br>Pairs in window: %{customdata[2]}<extra></extra>",
+                            customdata=np.column_stack([ci_low, ci_high, rolling["rolling_observations"], rolling["effective_observations"]]),
+                            hovertemplate="Date: %{x|%Y-%m-%d}<br>Rolling r: %{y:.3f}<br>Approx. interval: %{customdata[0]:.3f} to %{customdata[1]:.3f}<br>Pairs in window: %{customdata[2]}<br>Approx. effective observations: %{customdata[3]:.1f}<extra></extra>",
                         ))
                         roll_fig.add_hline(y=0, line_dash="dash", line_color="#94A3B8")
                         roll_fig.update_layout(title=f"Relationship stability · {rolling_window}-observation rolling correlation", height=350, margin={"l": 55, "r": 20, "t": 55, "b": 45}, paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", font={"color": "#D9E2F0", "size": 11}, yaxis={"range": [-1, 1], "title": "Pearson r"}, xaxis_title="Date", legend={"orientation": "h", "y": 1.12})
                         roll_fig.update_xaxes(gridcolor="rgba(154, 167, 186, 0.16)")
                         roll_fig.update_yaxes(gridcolor="rgba(154, 167, 186, 0.16)")
                         st.plotly_chart(roll_fig, use_container_width=True, theme=None, config={"displaylogo": False})
-                        st.caption("The shaded band is an approximate 95% interval for each window, based on a Fisher transformation and an independence assumption. Windows overlap, so the band is not a simultaneous confidence band and may be too narrow when changes are serially dependent. Sign flips can reflect genuine instability or sampling noise.")
+                        st.caption("The shaded band is a pointwise approximate 95% Fisher interval using a Bartlett-style effective sample size that discounts some serial dependence inside each window. It is not a simultaneous band, does not fully correct dependence or non-stationarity, and windows overlap heavily. Sign flips may reflect changing relationships, sampling noise, or both.")
                     else:
                         st.info("Not enough matched observations to draw the selected rolling-correlation window.")
                 else:
@@ -851,6 +873,7 @@ def main() -> None:
                 st.info("Add a target series such as an index or company to measure its response after a primary-variable event.")
             else:
                 st.markdown("**Question:** after a defined increase or decrease in the main variable, did the target's later behaviour differ from its ordinary non-event response?")
+                st.caption("Formation window = how many observations are used to measure the main-variable move ending on the event date. Response horizon = how many target observations forward from that event date are measured. They are separate settings.")
                 target_label = st.selectbox("Target whose response is measured", comparison_labels, key="event_target_v11")
                 ecols = st.columns(4)
                 with ecols[0]:
@@ -862,6 +885,7 @@ def main() -> None:
                 with ecols[3]:
                     response_label = st.selectbox("Target response units", ["Percentage change", "Absolute change"], index=0, key="event_response_mode_v11")
                 horizons = st.multiselect("Measure response after", [1, 2, 3, 5, 10, 20, 30, 60], default=[1, 3, 5, 20], format_func=lambda n: f"{n} target observations", key="event_horizons_v11")
+                st.warning("Predefine your event threshold and response horizons where possible. The current intervals do not correct for trying many thresholds, horizons or event definitions and then highlighting the most attractive result.")
                 if not horizons:
                     st.info("Select at least one response horizon.")
                 else:
@@ -981,14 +1005,15 @@ def main() -> None:
             if not comparison_labels:
                 st.info("Add a comparison series to test lead/lag timing.")
             else:
-                compared = st.selectbox("Compare timing with", comparison_labels, key="lag_target_v11")
+                compared = st.selectbox("Compare timing with", comparison_labels, key="lag_target_v14")
                 lcols = st.columns(3)
                 with lcols[0]:
-                    window = st.select_slider("Measure changes over", options=[1, 3, 5, 10, 20, 60], value=5, format_func=lambda n: f"{n} observations", key="lag_window_v11")
+                    window = st.select_slider("Change-formation window", options=[1, 3, 5, 10, 20, 60], value=5, format_func=lambda n: f"{n} observations", key="lag_window_v14", help="Each variable's change is calculated over this many of its observations before matching dates.")
                 with lcols[1]:
-                    transform_label = st.selectbox("Change measure", ["Percentage change", "Absolute change"], index=0, key="lag_transform_v11")
+                    transform_label = st.selectbox("Change measure", ["Percentage change", "Absolute change"], index=0, key="lag_transform_v14")
                 with lcols[2]:
-                    max_lag = st.select_slider("Check timing up to", options=[1, 3, 5, 10, 20], value=5, format_func=lambda n: f"±{n} observations", key="lag_max_v11")
+                    max_lag = st.select_slider("Test offsets up to", options=[1, 2, 3, 5, 10], value=5, format_func=lambda n: f"±{n} windows ({n * window} observations)", key="lag_max_v14", help="Lags are spaced by a full change window. This avoids testing adjacent overlapping multi-observation return windows. For a 5-observation window, offsets are 0, ±5, ±10, and so on.")
+                st.caption(f"Interpretation: each series' change is measured over {window} observations. The comparison series is then aligned {window} observations earlier/later at each step, so the price intervals are adjacent rather than overlapping. Offsets count matched observations, not guaranteed calendar days.")
                 result = lead_lag_statistics(
                     primary, available[compared], int(window),
                     "pct" if transform_label == "Percentage change" else "diff",
@@ -997,19 +1022,19 @@ def main() -> None:
                 lag_fig = go.Figure()
                 lag_low = pd.to_numeric(result["ci_low"], errors="coerce")
                 lag_high = pd.to_numeric(result["ci_high"], errors="coerce")
-                lag_fig.add_trace(go.Scatter(x=result["lag_observations"], y=lag_low, mode="lines", line={"width": 0}, showlegend=False, hoverinfo="skip", name="Approx. 95% lower bound"))
-                lag_fig.add_trace(go.Scatter(x=result["lag_observations"], y=lag_high, mode="lines", line={"width": 0}, fill="tonexty", fillcolor="rgba(56, 189, 248, 0.15)", showlegend=True, name="Approx. 95% pointwise interval", hoverinfo="skip"))
+                lag_fig.add_trace(go.Scatter(x=result["lag_observations"], y=lag_low, mode="lines", line={"width": 0}, showlegend=False, hoverinfo="skip", name="Block bootstrap lower bound"))
+                lag_fig.add_trace(go.Scatter(x=result["lag_observations"], y=lag_high, mode="lines", line={"width": 0}, fill="tonexty", fillcolor="rgba(56, 189, 248, 0.15)", showlegend=True, name="95% moving-block-bootstrap interval", hoverinfo="skip"))
                 lag_fig.add_trace(go.Scatter(
                     x=result["lag_observations"], y=result["correlation"], mode="lines+markers",
                     line={"color": "#38BDF8", "width": 2}, marker={"size": 7}, name="Correlation by lag",
-                    customdata=np.column_stack([result["observations"], lag_low, lag_high]),
-                    hovertemplate="Lag: %{x} matched observations<br>Correlation: %{y:.3f}<br>Approx. interval: %{customdata[1]:.3f} to %{customdata[2]:.3f}<br>Matched pairs: %{customdata[0]}<extra></extra>",
+                    customdata=np.column_stack([result["observations"], lag_low, lag_high, result["familywise_adjusted_p_value"]]),
+                    hovertemplate="Offset: %{x} matched observations<br>Correlation: %{y:.3f}<br>Block-bootstrap interval: %{customdata[1]:.3f} to %{customdata[2]:.3f}<br>Matched pairs: %{customdata[0]}<br>Family-wise adjusted p: %{customdata[3]:.3f}<extra></extra>",
                 ))
                 lag_fig.add_vline(x=0, line_dash="dash", line_color="#F59E0B")
                 lag_fig.add_hline(y=0, line_dash="dot", line_color="#94A3B8")
                 valid_corr = pd.to_numeric(result["correlation"], errors="coerce").dropna()
                 valid_bounds = pd.concat([lag_low, lag_high, valid_corr], ignore_index=True).dropna()
-                full_lag_scale = st.checkbox("Use full correlation scale (−1 to +1)", value=False, key="lag_full_scale_v13")
+                full_lag_scale = st.checkbox("Use full correlation scale (−1 to +1)", value=False, key="lag_full_scale_v14")
                 if full_lag_scale or valid_bounds.empty:
                     y_range = [-1, 1]
                 else:
@@ -1017,33 +1042,43 @@ def main() -> None:
                     pad = max((high_edge - low_edge) * 0.20, 0.03)
                     y_range = [max(-1, low_edge - pad), min(1, high_edge + pad)]
                 lag_fig.update_layout(
-                    title="Correlation at different time alignments",
-                    xaxis_title="Comparison series timing relative to main variable (observations; negative = earlier)",
-                    yaxis_title="Pearson correlation", yaxis={"range": y_range}, height=410,
-                    margin={"l": 55, "r": 20, "t": 65, "b": 75},
+                    title=f"Lead/lag association · {window}-observation change windows · non-overlapping tested offsets",
+                    xaxis_title="Comparison-series offset in matched observations (negative = earlier, positive = later)",
+                    yaxis_title="Pearson correlation", yaxis={"range": y_range}, height=430,
+                    margin={"l": 60, "r": 25, "t": 65, "b": 80},
                     paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", font={"color": "#D9E2F0", "size": 11},
                     legend={"orientation": "h", "y": 1.12},
                 )
-                lag_fig.update_xaxes(gridcolor="rgba(154, 167, 186, 0.16)")
+                lag_fig.update_xaxes(gridcolor="rgba(154, 167, 186, 0.16)", dtick=window)
                 lag_fig.update_yaxes(gridcolor="rgba(154, 167, 186, 0.16)")
                 st.plotly_chart(lag_fig, use_container_width=True, theme=None, config={"displaylogo": False})
+                lag_table = result[["lag_observations", "correlation", "ci_low", "ci_high", "familywise_adjusted_p_value", "observations"]].rename(columns={
+                    "lag_observations": "Offset (matched observations)", "correlation": "Pearson r",
+                    "ci_low": "Block-bootstrap 2.5%", "ci_high": "Block-bootstrap 97.5%",
+                    "familywise_adjusted_p_value": "Family-wise adjusted p", "observations": "Matched pairs",
+                })
+                st.dataframe(lag_table, use_container_width=True, hide_index=True)
                 usable = result.dropna(subset=["correlation"])
                 if not usable.empty:
                     peak = usable.loc[usable["correlation"].abs().idxmax()]
                     lag = int(peak["lag_observations"])
                     direction = "earlier" if lag < 0 else "later" if lag > 0 else "at the same matched observation"
                     peak_value = float(peak["correlation"])
-                    ci_low = peak.get("ci_low")
-                    ci_high = peak.get("ci_high")
-                    if ci_low is None or ci_high is None or pd.isna(ci_low) or pd.isna(ci_high):
-                        st.info(f"The largest absolute correlation was {_format_value(peak_value)} at lag {lag} ({direction}), based on {int(peak['observations'])} matched pairs. Its interval is unavailable, so treat it as a descriptive peak only.")
-                    elif float(ci_low) <= 0 <= float(ci_high):
-                        st.info(f"The largest absolute observed correlation was {_format_value(peak_value)} at lag {lag} ({direction}), based on {int(peak['observations'])} pairs. Its approximate interval ({float(ci_low):.3f} to {float(ci_high):.3f}) includes zero, so the sample does not clearly distinguish this peak from zero. This is the maximum selected from {len(usable)} lags and may be inflated by searching.")
+                    ci_low, ci_high = peak.get("ci_low"), peak.get("ci_high")
+                    adjusted_p = peak.get("familywise_adjusted_p_value")
+                    if adjusted_p is None or pd.isna(adjusted_p):
+                        st.warning(f"The largest absolute correlation was {peak_value:.3f} at offset {lag} ({direction}), but there were not enough valid circular shifts to assess the tested-lag family. Treat the peak as descriptive only.")
+                    elif float(adjusted_p) >= 0.05:
+                        st.info(f"The largest absolute correlation was {peak_value:.3f} at offset {lag} ({direction}). Its family-wise circular-shift adjusted p-value is {float(adjusted_p):.3f}, which does not meet the conventional 0.05 threshold after accounting for the search across {int(peak['tested_lags_count'])} offsets. This is not evidence of a reliable lead/lag effect.")
                     else:
-                        st.warning(f"The peak correlation was {_format_value(peak_value)} at lag {lag} ({direction}), and its approximate pointwise interval ({float(ci_low):.3f} to {float(ci_high):.3f}) excludes zero under an independent-pair assumption. Because this was selected as the strongest of {len(usable)} tested lags, it is a candidate for further testing, not confirmatory evidence.")
-                    if abs(peak_value) < 0.10:
-                        st.caption("The strongest correlation is numerically close to zero in this run; no pronounced lead/lag pattern stands out. This is a descriptive observation, not a universal cutoff.")
-                st.caption("The shaded band is an approximate pointwise Fisher-transformation interval assuming independent paired changes. It is not adjusted for serial dependence or the number of lags tested. Lag counts matched observations, not automatically calendar days. The default y-axis zooms into the observed range for readability; use the full-scale checkbox to restore −1 to +1.")
+                        st.warning(f"The largest absolute correlation was {peak_value:.3f} at offset {lag} ({direction}); its family-wise circular-shift adjusted p-value is {float(adjusted_p):.3f}. This is a candidate association under the circular-shift/stationarity assumptions, not proof of prediction or causation. Confirm it on a pre-specified untouched period.")
+                    if ci_low is not None and ci_high is not None and not pd.isna(ci_low) and not pd.isna(ci_high):
+                        st.caption(f"Moving-block-bootstrap 95% interval at this selected peak: {float(ci_low):.3f} to {float(ci_high):.3f}. Because the peak was selected from the tested offsets, use the family-wise adjusted p-value for the search-level assessment, not the pointwise interval alone.")
+                if int(result["null_shift_replicates"].max()) == 0:
+                    st.warning("The study period is too short relative to the requested lag range for the circular-shift test. Reduce the number of offsets or widen the study period.")
+                if result["ci_low"].isna().all():
+                    st.warning("The moving-block-bootstrap interval is unavailable: the sample cannot support at least three blocks long enough to cover the largest tested lag and formation window. Reduce the tested lag span or formation window, or widen the study period.")
+                st.caption("Intervals use a moving-block bootstrap of paired changes to approximately preserve local serial dependence. Family-wise adjusted p-values compare each lag against the maximum absolute correlation under circular shifts, controlling the search over the tested offsets if the change process is sufficiently stationary. This is not a multiple-variable correction and not a causal test. Choose lags before inspecting results wherever possible.")
 
     with data_tab:
         chosen = st.selectbox("Show observations for", list(available), key="raw_series_selection")
