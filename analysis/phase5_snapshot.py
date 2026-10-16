@@ -144,16 +144,13 @@ def _rows_from_prediction_folds(folds: Iterable[Any]) -> list[dict[str, Any]]:
     return rows
 
 
-
 def _validate_probability_source_trace(
     fold_index: int,
     method_label: str,
     output: dict[str, Any],
     stored_probability_values: list[float],
 ) -> None:
-    """Validate the builder metadata needed to explain empirical probabilities."""
-    from .outcome_labels import OUTCOME_CLASSES
-
+    """Validate builder traces needed to explain empirical probabilities."""
     vector_key = f"method_{method_label.lower()}_probabilities_pct"
     for key in ("class_counts", "weighted_class_counts"):
         mapping = output.get(key)
@@ -189,9 +186,52 @@ def _validate_probability_source_trace(
             f"Fold {fold_index} method {method_label} output is missing probability_basis."
         )
 
+    is_limited = bool(output.get("limited"))
+    if method_label == "B":
+        # These diagnostics are part of the v2 Method B recording contract,
+        # even when a forecast is limited. Limited outputs may legitimately
+        # have no exact-condition count; usable outputs may not.
+        required_diagnostics = (
+            "exact_condition_count",
+            "weight_concentration",
+            "stability_score",
+        )
+        missing_diagnostics = [key for key in required_diagnostics if key not in output]
+        if missing_diagnostics:
+            raise ValueError(
+                f"Fold {fold_index} method B output is missing required diagnostics: {missing_diagnostics}."
+            )
+        exact_count = output.get("exact_condition_count")
+        if exact_count is not None:
+            try:
+                exact_count_number = float(exact_count)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"Fold {fold_index} method B exact_condition_count is invalid."
+                ) from exc
+            if not isfinite(exact_count_number) or exact_count_number < 0 or not exact_count_number.is_integer():
+                raise ValueError(
+                    f"Fold {fold_index} method B exact_condition_count must be a finite non-negative integer or null."
+                )
+        elif not is_limited:
+            raise ValueError(
+                f"Fold {fold_index} usable method B output requires exact_condition_count."
+            )
+        for key in ("weight_concentration", "stability_score"):
+            try:
+                value = float(output[key])
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError(
+                    f"Fold {fold_index} method B {key} must be finite and non-negative."
+                ) from exc
+            if not isfinite(value) or value < 0:
+                raise ValueError(
+                    f"Fold {fold_index} method B {key} must be finite and non-negative."
+                )
+
     # Limited outputs intentionally carry an all-zero vector and empty counts.
-    # Usable outputs must reconstruct exactly from the weighted class shares.
-    if bool(output.get("limited")):
+    # Usable outputs must reconstruct exactly from weighted class shares.
+    if is_limited:
         return
 
     try:
@@ -447,7 +487,7 @@ def export_phase5_snapshot(
         raise FileExistsError(
             f"Snapshot already exists: {destination}. "
             "Frozen Phase 5 snapshots are immutable. The canonical run artifact already exists; "
-        "move it aside only when intentionally replacing it after a new validation run."
+            "move it aside only when intentionally replacing it after a new validation run."
         )
 
     repo = Path(repository_root) if repository_root else Path.cwd()

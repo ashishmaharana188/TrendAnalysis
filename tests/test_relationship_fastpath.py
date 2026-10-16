@@ -1,21 +1,9 @@
 from datetime import date, timedelta
 
-from analysis.relationship import HistoricalRelationshipObservation, RelationshipDiscoveryEngine
-class _EngineAdapter:
-    min_observations = 5
-    min_state_coverage_pct = 75.0
-    min_family_coverage_pct = 75.0
-    stability_sem_multiplier = 2.0
-    candidate_batch_size = 8
-    progress_every_candidates = 1000
-    retain_supporting_data = True
-    progress_callback = None
-
-    @staticmethod
-    def _progress(_message):
-        return None
-
-
+from analysis.relationship import (
+    HistoricalRelationshipObservation,
+    RelationshipDiscoveryEngine,
+)
 from analysis.relationship_fastpath import (
     method_a_prepared,
     method_b_prepared,
@@ -63,11 +51,17 @@ def _assert_equivalent(left, right):
         assert abs(a - b) <= 1e-12, f"{name}: {a!r} != {b!r}"
 
 
+def _valid_method_a_candidate(engine, current, history):
+    discovered = engine.method_a_similar_states(current, history)
+    assert discovered, "The reference engine must produce at least one Method-A candidate"
+    return tuple(discovered[0].variables)
+
+
 def test_prepared_method_b_matches_reference_engine():
     history = _history()
     current = dict(history[-1].states)
     reference_engine = RelationshipDiscoveryEngine(max_order=2, min_observations=5)
-    engine = _EngineAdapter()
+    engine = RelationshipDiscoveryEngine(max_order=2, min_observations=5)
     candidates = [
         ("company.market.price",),
         ("macro.rate",),
@@ -89,10 +83,12 @@ def test_prepared_method_a_matches_reference_for_same_candidate():
     history = _history()
     current = dict(history[-1].states)
     reference_engine = RelationshipDiscoveryEngine(max_order=2, min_observations=5)
-    engine = _EngineAdapter()
-    candidate = tuple(sorted(current))
+    engine = RelationshipDiscoveryEngine(max_order=2, min_observations=5)
+    candidate = _valid_method_a_candidate(reference_engine, current, history)
 
-    reference = reference_engine.method_a_similar_states(current, history)
+    reference = reference_engine.method_a_similar_states(
+        current, history, candidate_sets=[candidate]
+    )
     context = prepare_relationship_context(current, history)
     fast = method_a_prepared(engine, current, history, [candidate], context)
 
@@ -104,7 +100,7 @@ def test_prepared_method_a_matches_reference_for_same_candidate():
 def test_prepared_context_reuse_is_supported():
     history = _history()
     current = dict(history[-1].states)
-    engine = _EngineAdapter()
+    engine = RelationshipDiscoveryEngine(max_order=2, min_observations=5)
     context = prepare_relationship_context(current, history)
     candidates = [("company.market.price",), ("macro.rate",)]
 
@@ -114,34 +110,53 @@ def test_prepared_context_reuse_is_supported():
 
 def test_compact_support_matches_materialized_support():
     from analysis.relationship_fastpath import materialize_selected_support
+
     history = _history()
     current = dict(history[-1].states)
     reference_engine = RelationshipDiscoveryEngine(max_order=2, min_observations=5)
-    engine = _EngineAdapter()
-    candidate = tuple(sorted(current))
+    engine = RelationshipDiscoveryEngine(max_order=2, min_observations=5)
+    candidate = _valid_method_a_candidate(reference_engine, current, history)
     context = prepare_relationship_context(current, history)
 
-    reference = next(item for item in reference_engine.method_a_similar_states(current, history) if item.variables == candidate)
-    compact = method_a_prepared(engine, current, history, [candidate], context, compact_support=True)
+    reference_results = reference_engine.method_a_similar_states(
+        current, history, candidate_sets=[candidate]
+    )
+    assert len(reference_results) == 1
+    reference = reference_results[0]
+
+    compact = method_a_prepared(
+        engine, current, history, [candidate], context, compact_support=True
+    )
     assert len(compact) == 1
     assert compact[0].supporting_observations == ()
     assert compact[0].supporting_weights == ()
-    materialized = materialize_selected_support(compact[0], current, context, compact.support_matrix[0])
+    materialized = materialize_selected_support(
+        compact[0], current, context, compact.support_matrix[0]
+    )
     assert materialized.supporting_observations == reference.supporting_observations
     assert materialized.supporting_weights == reference.supporting_weights
 
 
 def test_compact_method_b_materialization_matches_reference():
     from analysis.relationship_fastpath import materialize_selected_support
+
     history = _history()
     current = dict(history[-1].states)
     reference_engine = RelationshipDiscoveryEngine(max_order=2, min_observations=5)
-    engine = _EngineAdapter()
+    engine = RelationshipDiscoveryEngine(max_order=2, min_observations=5)
     candidate = ("macro.rate",)
     context = prepare_relationship_context(current, history)
 
-    reference = next(item for item in reference_engine.method_b_conditioned_distribution(current, history) if item.variables == candidate)
-    compact = method_b_prepared(engine, current, history, [candidate], context, compact_support=True)
-    materialized = materialize_selected_support(compact[0], current, context, compact.support_matrix[0])
+    reference = next(
+        item
+        for item in reference_engine.method_b_conditioned_distribution(current, history)
+        if item.variables == candidate
+    )
+    compact = method_b_prepared(
+        engine, current, history, [candidate], context, compact_support=True
+    )
+    materialized = materialize_selected_support(
+        compact[0], current, context, compact.support_matrix[0]
+    )
     assert materialized.supporting_observations == reference.supporting_observations
     assert materialized.supporting_weights == reference.supporting_weights

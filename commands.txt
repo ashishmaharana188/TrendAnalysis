@@ -1,5 +1,6 @@
 source .venv/Scripts/activate
 py -m streamlit run dashboard.py
+python -m streamlit run app/main.py
 
 duckdb -ui
 

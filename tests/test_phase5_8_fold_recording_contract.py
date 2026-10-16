@@ -35,6 +35,9 @@ def complete_row() -> dict:
         "class_counts": {"UP": 4, "SIDEWAYS": 5, "DOWN": 11},
         "weighted_class_counts": {"UP": 20.0, "SIDEWAYS": 25.0, "DOWN": 55.0},
         "probability_basis": "method_b_weighted_empirical_conditional_class_share",
+        "exact_condition_count": 3,
+        "weight_concentration": 0.15,
+        "stability_score": 0.8,
     }
     selection_a = {"selection_status": "SELECTED_AFTER_ADJUSTED_P_THRESHOLD"}
     selection_b = {"selection_status": "REJECTED_NO_CANDIDATE_PASSED_ADJUSTED_P_THRESHOLD"}
@@ -139,6 +142,13 @@ def test_contract_v2_rejects_weighted_counts_that_do_not_reconstruct_vector() ->
         validate_fold_recording_contract([row])
 
 
+def test_contract_v2_rejects_missing_method_b_diagnostics() -> None:
+    row = complete_row()
+    del row["method_b_output"]["weight_concentration"]
+    with pytest.raises(ValueError, match="missing required diagnostics"):
+        validate_fold_recording_contract([row])
+
+
 def test_legacy_contract_v1_remains_validatable() -> None:
     row = complete_row()
     for method in ("a", "b"):
@@ -146,6 +156,8 @@ def test_legacy_contract_v1_remains_validatable() -> None:
         output.pop("class_counts")
         output.pop("weighted_class_counts")
         output.pop("probability_basis")
+    for field in ("exact_condition_count", "weight_concentration", "stability_score"):
+        row["method_b_output"].pop(field)
     row["fold_recording_contract_version"] = 1
     row["selection_metadata"]["recording_contract_version"] = 1
     report = validate_fold_recording_contract([row], contract_version=1)

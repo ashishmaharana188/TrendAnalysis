@@ -143,7 +143,7 @@ def test_hardened_selection_uses_support_retaining_engine(monkeypatch):
         prediction_date=base + timedelta(days=20),
     )
 
-    selected, evaluations, controlled = _holdout_select(
+    selected, evaluations, controlled, metadata = _holdout_select(
         "A",
         [candidate],
         {"company.market.price": "Rising / High"},
@@ -155,6 +155,9 @@ def test_hardened_selection_uses_support_retaining_engine(monkeypatch):
 
     assert evaluations == 1
     assert controlled is True
+    assert isinstance(metadata, dict)
+    assert metadata["method"] == "A"
+    assert metadata["candidate_evaluation_count"] == 1
     assert selected is None or selected.variables == candidate.variables
 
 
@@ -206,7 +209,7 @@ def test_search_adjusted_pvalues_are_not_bh_recorrected(monkeypatch):
     from datetime import date
 
     import analysis.walk_forward_relationship as walk_forward
-    from analysis.hardening_4_10 import SearchAdjustedPermutationResult, TestingFamily
+    from analysis.hardening_4_10 import TestingFamily
     from analysis.relationship import (
         HistoricalRelationshipObservation,
         RelationshipDiscoveryEngine,
@@ -260,18 +263,11 @@ def test_search_adjusted_pvalues_are_not_bh_recorrected(monkeypatch):
         )
     ]
 
-    fake_result = SearchAdjustedPermutationResult(
-        family_id="TEST|company|A|2025-02-01",
-        candidate_count=candidate_count,
-        permutation_count=199,
-        raw_p_values=(float("nan"),) * candidate_count,
-        max_statistic_p_values=(0.005,) + (1.0,) * (candidate_count - 1),
-    )
-
+    fake_adjusted_p_values = (0.005,) + (1.0,) * (candidate_count - 1)
     monkeypatch.setattr(
         walk_forward,
-        "search_adjusted_permutation_p_values",
-        lambda *args, **kwargs: fake_result,
+        "search_adjusted_permutation_p_values_matrix",
+        lambda *args, **kwargs: fake_adjusted_p_values,
     )
 
     family = TestingFamily(
@@ -281,7 +277,7 @@ def test_search_adjusted_pvalues_are_not_bh_recorrected(monkeypatch):
         prediction_date=date(2025, 2, 1),
     )
 
-    selected, evaluations, controlled = walk_forward._holdout_select(
+    selected, evaluations, controlled, metadata = walk_forward._holdout_select(
         "A",
         candidates,
         {f"feature_{i}": "state" for i in range(candidate_count)},
@@ -295,3 +291,7 @@ def test_search_adjusted_pvalues_are_not_bh_recorrected(monkeypatch):
     assert controlled is True
     assert selected is not None
     assert selected.variables == ("feature_0",)
+    assert metadata["selection_status"] == "SELECTED_AFTER_ADJUSTED_P_THRESHOLD"
+    assert metadata["multiple_testing"]["accepted_candidate_count"] == 1
+    assert metadata["multiple_testing"]["minimum_adjusted_p_value"] == 0.005
+    assert metadata["multiple_testing"]["selected_adjusted_p_value"] == 0.005

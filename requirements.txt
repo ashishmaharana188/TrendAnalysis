@@ -9,4 +9,5 @@ beautifulsoup4
 python-dotenv
 streamlit
 plotly
+scipy
 #sentence-transformers
