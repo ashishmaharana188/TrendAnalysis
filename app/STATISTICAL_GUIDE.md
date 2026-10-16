@@ -75,3 +75,8 @@ Do not label a result good or bad from one coefficient. Inspect:
 5. **Incremental value:** does it add information over an appropriate ordinary-response baseline?
 
 The current UI is exploratory. The lead/lag plot now uses non-overlapping tested offsets, moving-block-bootstrap intervals, and a circular-shift maximum-statistic p-value adjusted across the tested lags. Pair/rolling intervals use an approximate autocorrelation-based effective sample size; event-response differences use moving-block bootstrap intervals. None of these methods corrects all forms of dependence or all the other analyst choices. Cross-variable searches, repeated threshold/horizon tuning and chart interpretation still require pre-specified hypotheses, explicit multiple-testing control and confirmation on untouched chronological data before strong claims of statistical significance, causality or trading usefulness are justified.
+
+
+## Multiple variables in event and lead/lag analyses
+
+The event-defining variable/reference variable is a role in a particular research question, not a restriction to the workspace's main series. Event Study allows one selected event definition to be compared against multiple response targets. Lead/Lag allows one selected reference series to be compared against multiple series in one run. Each target/comparison remains a distinct result; it is not collapsed into a single pooled outcome. Lead/lag p-values are adjusted across offsets within each pair and then conservatively adjusted across the selected comparison set. Event-study intervals are not automatically corrected for selecting many event targets, thresholds or horizons, so treat multi-target results as exploratory and pre-specify the key comparisons when possible.

@@ -10,7 +10,7 @@ import duckdb
 
 DEFAULT_DB_PATH = (
     Path(__file__).resolve().parents[2]
-    / "TrendAnalysis"
+    / "financial_etl_project"
     / "market_data.duckdb"
 )
 

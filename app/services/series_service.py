@@ -6,13 +6,20 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from data_access.derivatives import get_futures_basis_history, get_options_history, get_unified_market_matrix
+from data_access.derivatives import get_futures_basis_history, get_unified_market_matrix
 from data_access.institutional import get_institutional_flow_history, get_institutional_history
 from data_access.macro_global import get_macro_history
+from data_access.query import execute_arrow
 
 from .catalog import (
-    SOURCE_BASIS, SOURCE_INSTITUTIONAL, SOURCE_MACRO, SOURCE_MARKET,
-    SOURCE_MATRIX, SOURCE_OPTIONS, FINANCIAL_METRICS, SeriesRequest, get_financial_loader,
+    SOURCE_BASIS, SOURCE_COMMODITY_FUTURES, SOURCE_COMMODITY_OPTIONS,
+    SOURCE_FUTURES, SOURCE_INSTITUTIONAL, SOURCE_MACRO, SOURCE_MARKET,
+    SOURCE_MATRIX, SOURCE_OPTIONS, RAW_DERIVATIVE_FILTERS, FINANCIAL_METRICS,
+    SeriesRequest, get_financial_loader,
+)
+from .derivative_helpers import (
+    add_futures_basis_columns, aggregate_option_contracts,
+    select_representative_futures_contract,
 )
 from .market_series import load_freshest_market_history
 
@@ -60,6 +67,51 @@ def _series_frame(df: pd.DataFrame, date_col: str, value_col: str, label: str) -
     return result
 
 
+def _date_param(value: date | datetime | str | None):
+    if isinstance(value, datetime):
+        return value.date()
+    return value
+
+
+def _load_raw_derivative_contracts(
+    source: str,
+    ticker: str,
+    start_date: date | datetime | str | None = None,
+    end_date: date | datetime | str | None = None,
+) -> pd.DataFrame:
+    """Load contracts for the exact selected ticker from unified_market_master.
+
+    The catalogue and history loader share the same instrument predicate. The
+    query never substitutes another company when the selected ticker has no data.
+    """
+    if source not in RAW_DERIVATIVE_FILTERS:
+        raise ValueError(f"No raw derivative filter configured for {source!r}")
+    predicate = RAW_DERIVATIVE_FILTERS[source]
+    sql = f"""
+        SELECT
+            "Ticker" AS ticker, "ReportDate" AS report_date,
+            "InstrumentType" AS instrument_type, "ExpiryDate" AS expiry_date,
+            "StrikePrice" AS strike_price, "OptionType" AS option_type,
+            "Open" AS open, "High" AS high, "Low" AS low,
+            "Close" AS close, "Volume" AS volume,
+            "Open_Interest" AS open_interest, "Change_In_OI" AS change_in_oi,
+            "Settlement_Price" AS settlement_price, "Underlying_Price" AS underlying_price,
+            "Exchange_Series" AS exchange_series
+        FROM unified_market_master
+        WHERE "Ticker" = ? AND {predicate}
+    """
+    params: list[Any] = [ticker]
+    if start_date is not None:
+        sql += ' AND "ReportDate" >= ?'
+        params.append(_date_param(start_date))
+    if end_date is not None:
+        sql += ' AND "ReportDate" <= ?'
+        params.append(_date_param(end_date))
+    sql += ' ORDER BY "ReportDate", "ExpiryDate"'
+    table = execute_arrow(sql, params)
+    return table.to_pandas() if hasattr(table, "to_pandas") else pd.DataFrame(table)
+
+
 def load_series(
     request: SeriesRequest,
     start_date: date | datetime | str | None = None,
@@ -83,27 +135,20 @@ def load_series(
     elif source == SOURCE_MATRIX:
         frame = _to_frame(get_unified_market_matrix(identifier, start_date=start_date, end_date=end_date))
         result = _series_frame(frame, "date", metric, request.label)
-    elif source == SOURCE_OPTIONS:
-        frame = _to_frame(get_options_history(identifier, start_date=start_date, end_date=end_date))
-        if not frame.empty:
-            date_col = _col(frame, "report_date")
-            puts_oi, calls_oi = _col(frame, "total_put_oi"), _col(frame, "total_call_oi")
-            puts_vol, calls_vol = _col(frame, "total_put_volume"), _col(frame, "total_call_volume")
-            aggregations: dict[str, str] = {}
-            for column in (puts_oi, calls_oi, puts_vol, calls_vol):
-                if column is not None:
-                    aggregations[column] = "sum"
-            if date_col is not None and aggregations:
-                frame = frame.groupby(date_col, as_index=False).agg(aggregations)
-                if puts_oi and calls_oi and puts_oi in frame and calls_oi in frame:
-                    frame["oi_pcr"] = np.where(frame[calls_oi] != 0, frame[puts_oi] / frame[calls_oi], np.nan)
-                if puts_vol and calls_vol and puts_vol in frame and calls_vol in frame:
-                    frame["volume_pcr"] = np.where(frame[calls_vol] != 0, frame[puts_vol] / frame[calls_vol], np.nan)
+    elif source in (SOURCE_OPTIONS, SOURCE_COMMODITY_OPTIONS):
+        # Raw contract query keeps options for the selected underlying exact.
+        contracts = _load_raw_derivative_contracts(source, identifier, start_date, end_date)
+        frame = aggregate_option_contracts(contracts)
+        result = _series_frame(frame, "report_date", metric, request.label)
+    elif source in (SOURCE_FUTURES, SOURCE_COMMODITY_FUTURES):
+        contracts = _load_raw_derivative_contracts(source, identifier, start_date, end_date)
+        frame = select_representative_futures_contract(contracts)
+        frame = add_futures_basis_columns(frame)
         result = _series_frame(frame, "report_date", metric, request.label)
     elif source == SOURCE_BASIS:
         frame = _to_frame(get_futures_basis_history(identifier, start_date=start_date, end_date=end_date))
         if not frame.empty and "report_date" in frame.columns:
-            # Select the highest-open-interest expiry per date to avoid duplicate dates.
+            # Legacy cash-linked view supports stock/index underlyings only.
             if "open_interest" in frame.columns:
                 frame = frame.sort_values(["report_date", "open_interest"], ascending=[True, False], na_position="last")
             frame = frame.drop_duplicates("report_date", keep="first")
@@ -153,17 +198,26 @@ def series_construction_note(request: SeriesRequest) -> str:
     if request.source == SOURCE_MATRIX:
         return ("This is an ETL-precomputed daily field from mv_unified_market_matrix; "
                 "the app plots the stored field rather than recalculating it.")
-    if request.source == SOURCE_OPTIONS:
+    if request.source in (SOURCE_OPTIONS, SOURCE_COMMODITY_OPTIONS):
+        source_kind = "commodity" if request.source == SOURCE_COMMODITY_OPTIONS else "stock/index"
         if request.metric == "oi_pcr":
-            return ("Daily OI PCR = total put open interest divided by total call open interest, "
-                    "after summing expiry rows returned for the selected ticker and date.")
+            return (f"{source_kind.title()} options for exact underlying ticker {request.identifier}: put OI divided by call OI "
+                    "after summing eligible CE/PE contracts across all strikes and expiries per date. This is an underlying-level PCR, "
+                    "not a single-strike or single-expiry series.")
         if request.metric == "volume_pcr":
-            return ("Daily volume PCR = total put volume divided by total call volume, "
-                    "after summing expiry rows returned for the selected ticker and date.")
-        return "Options quantities are summed across the returned expiry rows for each date."
+            return (f"{source_kind.title()} options for exact underlying ticker {request.identifier}: put volume divided by call volume "
+                    "after summing eligible CE/PE contracts across all strikes and expiries per date.")
+        return (f"Raw option contracts are filtered to exact underlying ticker {request.identifier}; quantities are summed "
+                "across available strikes and expiries per date.")
+    if request.source in (SOURCE_FUTURES, SOURCE_COMMODITY_FUTURES):
+        source_kind = "commodity" if request.source == SOURCE_COMMODITY_FUTURES else "stock/index"
+        return (f"{source_kind.title()} futures are filtered to exact underlying ticker {request.identifier}. One contract is represented per date: "
+                "highest open interest, with earlier expiry as tie-breaker. The selected expiry may change over time. Basis is calculated only "
+                "where the raw record supplies an underlying price. Only contracts already present in unified_market_master appear; "
+                "the app does not ingest missing commodity data.")
     if request.source == SOURCE_BASIS:
-        return ("One futures expiry is represented per date: the contract with the highest recorded open interest. "
-                "The chosen expiry can change over time, so the series can roll between contracts.")
+        return ("Legacy stock/index spot-linked basis view. One expiry is represented per date using highest recorded open interest. "
+                "This view requires a matching cash-market row and is not the source for commodity futures.")
     if request.source == SOURCE_INSTITUTIONAL:
         raw_metrics = {
             "cash_buy_value", "cash_sell_value", "cash_net_value", "nifty_close",

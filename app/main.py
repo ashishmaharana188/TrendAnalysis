@@ -19,6 +19,9 @@ from app.components.charts import synchronized_series_chart, terminal_chart_html
 from app.services.catalog import (
     FINANCIAL_METRICS,
     SOURCE_BASIS,
+    SOURCE_COMMODITY_FUTURES,
+    SOURCE_COMMODITY_OPTIONS,
+    SOURCE_FUTURES,
     SOURCE_INSTITUTIONAL,
     SOURCE_MACRO,
     SOURCE_MARKET,
@@ -27,8 +30,10 @@ from app.services.catalog import (
     SeriesRequest,
     list_identifiers,
     metric_options,
+    commodity_contract_coverage,
 )
 from app.services.series_service import load_series, series_construction_note
+from app.services.derivative_helpers import find_exact_underlying_match, normalize_underlying_symbol
 from app.services.statistics_service import (
     correlation_matrix,
     distribution_frame,
@@ -52,8 +57,8 @@ DOMAIN_SOURCES = {
     "Market prices": [SOURCE_MARKET],
     "Macro & global": [SOURCE_MACRO],
     "Trading activity": [SOURCE_MATRIX],
-    "Options": [SOURCE_OPTIONS],
-    "Futures": [SOURCE_BASIS],
+    "Options": [SOURCE_OPTIONS, SOURCE_COMMODITY_OPTIONS],
+    "Futures": [SOURCE_FUTURES, SOURCE_BASIS, SOURCE_COMMODITY_FUTURES],
     "Institutional activity": [SOURCE_INSTITUTIONAL],
     "Company financials": list(FINANCIAL_METRICS),
 }
@@ -78,12 +83,20 @@ def cached_series(source: str, identifier: str, metric: str, start_date: date) -
     return load_series(SeriesRequest(source, identifier, metric), start_date=start_date, end_date=None)
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def cached_commodity_contract_coverage() -> list[dict[str, object]]:
+    return commodity_contract_coverage()
+
+
 def default_metric(source: str, metrics) -> str:
     preferred = {
         SOURCE_MARKET: "close",
         SOURCE_MACRO: "close",
         SOURCE_MATRIX: "close",
         SOURCE_OPTIONS: "oi_pcr",
+        SOURCE_COMMODITY_OPTIONS: "oi_pcr",
+        SOURCE_FUTURES: "close",
+        SOURCE_COMMODITY_FUTURES: "close",
         SOURCE_BASIS: "basis_percentage",
         SOURCE_INSTITUTIONAL: "future_index_net",
     }
@@ -104,10 +117,12 @@ def metric_help(source: str, metric: str) -> str:
         return "The default plots the series' closing/value observation. Choose another measure only when useful."
     if source == SOURCE_MATRIX:
         return "Trading activity includes fields such as volume, delivery, VWAP deviation and short activity."
-    if source == SOURCE_OPTIONS:
-        return "Put/call ratio compares aggregated put and call activity; it does not by itself prove market direction."
+    if source in (SOURCE_OPTIONS, SOURCE_COMMODITY_OPTIONS):
+        return "Put/call ratio compares aggregated put and call activity for the exact selected underlying. It does not by itself prove market direction."
+    if source in (SOURCE_FUTURES, SOURCE_COMMODITY_FUTURES):
+        return "The app selects the highest-open-interest contract for the chosen underlying on each date; the expiry can change over time."
     if source == SOURCE_BASIS:
-        return "Futures basis describes the futures price relative to its spot price."
+        return "The legacy stock/index futures basis view describes futures price relative to its matched cash price."
     if source == SOURCE_INSTITUTIONAL:
         return "Institutional figures are reported by client category and must be interpreted in context."
     return "Financial statement dates are accounting period ends, not necessarily publication dates."
@@ -162,7 +177,10 @@ def _friendly_series_label(request: SeriesRequest) -> str:
         SOURCE_MACRO: "Macro",
         SOURCE_MATRIX: "Trading activity",
         SOURCE_OPTIONS: "Options",
-        SOURCE_BASIS: "Futures",
+        SOURCE_COMMODITY_OPTIONS: "Commodity options",
+        SOURCE_FUTURES: "Futures",
+        SOURCE_COMMODITY_FUTURES: "Commodity futures",
+        SOURCE_BASIS: "Futures basis",
         SOURCE_INSTITUTIONAL: "Institutional",
     }
     domain = domain_short.get(request.source, FINANCIAL_SOURCE_LABELS.get(request.source, "Financials"))
@@ -211,8 +229,32 @@ def _time_range_control(label: str, key: str, default_amount: int = 12, default_
     return start, end
 
 
+def _selected_context_request(entries: list[dict[str, str]]) -> SeriesRequest | None:
+    """Return the current main series to guide stock/index/commodity F&O pickers."""
+    if not entries:
+        return None
+    wanted = st.session_state.get("main_variable")
+    requests = [_request_from_entry(entry) for entry in entries]
+    for request in requests:
+        if _friendly_series_label(request) == wanted:
+            return request
+    # On the first add/rerun the main-variable widget may not exist yet.
+    return requests[0]
+
+
 def _add_series_controls() -> None:
     entries: list[dict[str, str]] = st.session_state["workspace_series"]
+    derivative_sources = {
+        SOURCE_OPTIONS, SOURCE_COMMODITY_OPTIONS,
+        SOURCE_FUTURES, SOURCE_COMMODITY_FUTURES, SOURCE_BASIS,
+    }
+    derivative_source_labels = {
+        SOURCE_OPTIONS: "Stock / index options",
+        SOURCE_COMMODITY_OPTIONS: "Commodity options",
+        SOURCE_FUTURES: "Stock / index futures contracts",
+        SOURCE_COMMODITY_FUTURES: "Commodity futures contracts",
+        SOURCE_BASIS: "Stock / index spot-futures basis (legacy view)",
+    }
     with st.expander("Add a variable to the chart", expanded=not entries):
         st.caption("Choose a data type and a series. You can add as many series as you need.")
         domain_col, detail_col = st.columns([1, 1.5])
@@ -227,6 +269,14 @@ def _add_series_controls() -> None:
                     format_func=lambda item: FINANCIAL_SOURCE_LABELS.get(item, item),
                     key="add_financial_source",
                 )
+        elif domain in ("Futures", "Options"):
+            with detail_col:
+                source = st.selectbox(
+                    "Contract data",
+                    sources,
+                    format_func=lambda item: derivative_source_labels.get(item, item),
+                    key=f"add_contract_source_{domain}",
+                )
         else:
             source = sources[0]
             with detail_col:
@@ -234,35 +284,123 @@ def _add_series_controls() -> None:
                     "Market prices": "Historical price and volume",
                     "Macro & global": "Crude, currencies, yields, indices and other indicators",
                     "Trading activity": "Delivery, VWAP deviation, short activity and block trades",
-                    "Options": "Put/call positioning and volume",
-                    "Futures": "Spot/futures prices, basis and open interest",
                     "Institutional activity": "Institutional positioning and flow",
                 }.get(domain, domain))
 
+        catalogue_error = None
         try:
             identifiers = cached_identifiers(source)
         except Exception as exc:
             identifiers = []
+            catalogue_error = str(exc)
             st.warning(f"Could not load this catalogue: {exc}")
+        commodity_coverage: list[dict[str, object]] = []
+        if source in (SOURCE_COMMODITY_FUTURES, SOURCE_COMMODITY_OPTIONS):
+            try:
+                commodity_coverage = cached_commodity_contract_coverage()
+            except Exception as exc:
+                st.warning(f"Could not inspect raw commodity coverage: {exc}")
+            with st.expander("MCX / commodity raw-data coverage", expanded=not bool(identifiers)):
+                if commodity_coverage:
+                    coverage_frame = pd.DataFrame(commodity_coverage).rename(columns={
+                        "instrument_type": "Instrument type",
+                        "option_type": "Option side",
+                        "records": "Rows",
+                        "tickers": "Distinct tickers",
+                        "first_date": "First date",
+                        "latest_date": "Latest date",
+                    })
+                    st.dataframe(coverage_frame, use_container_width=True, hide_index=True)
+                    st.caption(
+                        "Coverage is counted directly from unified_market_master. FUTCOM is commodity futures; "
+                        "OPTFUT / OPTCOM are treated as commodity options only when OptionType is CE or PE."
+                    )
+                else:
+                    st.info(
+                        "No rows with InstrumentType FUTCOM, OPTFUT or OPTCOM were found in unified_market_master. "
+                        "This points to upstream ingestion or instrument-type mapping, not a charting issue."
+                    )
+
         if not identifiers:
-            st.info("No series are available in this data type. Check the database connection or choose another type.")
+            if catalogue_error is not None:
+                st.info("The catalogue query failed. Fix the database/query error above before concluding that the data is absent.")
+            elif source in (SOURCE_COMMODITY_FUTURES, SOURCE_COMMODITY_OPTIONS):
+                if commodity_coverage:
+                    raw_types = sorted({str(item.get("instrument_type", "")) for item in commodity_coverage})
+                    st.warning(
+                        f"Commodity rows exist ({', '.join(raw_types)}), but none matched this source's exact "
+                        "instrument/option-side filter. Inspect Option side in the coverage table above."
+                    )
+                else:
+                    st.warning(
+                        "No supported commodity contracts were found in unified_market_master. "
+                        "Check ingestion and InstrumentType mapping before debugging the chart."
+                    )
+            else:
+                st.info("No series are available in this data type. Check the database connection or choose another type.")
             return
 
         id_map = {item["value"]: item["label"] for item in identifiers}
-        identifier = st.selectbox(
-            "Series",
-            options=list(id_map),
-            format_func=lambda item: id_map.get(item, item),
-            key=f"add_identifier_{source}",
-            help="Choose a particular indicator, instrument, company or client category.",
-        )
+        context_request = _selected_context_request(entries) if source in derivative_sources else None
+        context_symbol = context_request.identifier if context_request is not None else None
+        exact_match = find_exact_underlying_match(context_symbol, identifiers) if source in derivative_sources else None
+
+        if source in derivative_sources:
+            # Crucial: use an exact match to the current main ticker where one
+            # exists; otherwise show a placeholder rather than silently selecting
+            # the first alphabetic underlying (often an unrelated company).
+            identifier_options = [None, *id_map.keys()]
+            if exact_match is not None:
+                selected_index = 1 + list(id_map).index(exact_match)
+            else:
+                selected_index = 0
+            context_key = normalize_underlying_symbol(context_symbol) or "no_context"
+            identifier = st.selectbox(
+                "Traded underlying",
+                options=identifier_options,
+                index=selected_index,
+                format_func=lambda item: "Choose an underlying explicitly…" if item is None else id_map.get(item, item),
+                key=f"add_identifier_{source}_{context_key}",
+                help="The underlying ticker must match the contract data. The app will not silently substitute another company.",
+            )
+            if context_symbol:
+                if exact_match:
+                    st.caption(f"Linked to main series by exact ticker match: {context_symbol} → {exact_match}")
+                else:
+                    st.info(
+                        f"No exact contract ticker matches the main series '{context_symbol}'. "
+                        "Choose a listed underlying deliberately. For example, a Brent benchmark and a domestic crude contract "
+                        "are related instruments, not the same ticker."
+                    )
+                if identifier is not None and normalize_underlying_symbol(identifier) != normalize_underlying_symbol(context_symbol):
+                    st.warning(
+                        f"Selected underlying {identifier} differs from the main series identifier {context_symbol}. "
+                        "This will be a manually chosen related-instrument comparison, not the same-company contract."
+                    )
+            if source in (SOURCE_COMMODITY_FUTURES, SOURCE_COMMODITY_OPTIONS):
+                st.caption(
+                    "Commodity contracts are read directly from unified_market_master, not the equity-linked basis view. "
+                    "FUTCOM is used for commodity futures; OPTFUT / OPTCOM with CE or PE are used for commodity options."
+                )
+            if identifier is None:
+                st.warning("Choose the underlying before adding this series. No default ticker will be substituted.")
+                return
+        else:
+            identifier = st.selectbox(
+                "Series",
+                options=list(id_map),
+                format_func=lambda item: id_map.get(item, item),
+                key=f"add_identifier_{source}",
+                help="Choose a particular indicator, instrument, company or client category.",
+            )
+
         metrics = metric_options(source)
         if not metrics:
             st.warning("No numeric measures are configured for this data type.")
             return
         default_key = default_metric(source, metrics)
         metric = default_key
-        change_measure = st.checkbox("Choose a different measure (optional)", value=False, key="change_measure")
+        change_measure = st.checkbox("Choose a different measure (optional)", value=False, key=f"change_measure_{source}")
         if change_measure:
             metric_map = {item.key: item.label for item in metrics}
             metric = st.selectbox(
@@ -343,10 +481,10 @@ def main() -> None:
             "Main variable for statistical comparisons",
             friendly_labels,
             key="main_variable",
-            help="Other selected series are compared with this variable. This does not change which series are drawn.",
+            help="Default reference for the workspace. Event Study and Lead/Lag also let you choose their reference variable independently.",
         )
     else:
-        st.caption(f"Main variable: {friendly_labels[0]}. Add another series to compare its movements or subsequent responses.")
+        st.caption(f"Workspace reference: {friendly_labels[0]}. Add series for comparisons; Lead/Lag and Event Study let you choose their reference independently.")
 
     st.divider()
     chart_col, analysis_col = st.columns([1, 1])
@@ -869,12 +1007,27 @@ def main() -> None:
                 st.info("Add at least one comparison series to inspect a pairwise relationship.")
 
         elif mode == "Response after events":
-            if not comparison_labels:
-                st.info("Add a target series such as an index or company to measure its response after a primary-variable event.")
+            event_source_label = st.selectbox(
+                "Variable that defines the event",
+                list(available),
+                index=list(available).index(primary_label) if primary_label in available else 0,
+                key="event_source_v17",
+                help="An event needs a defined trigger series. This can be any loaded variable; it does not have to be the workspace's main variable.",
+            )
+            event_source = available[event_source_label]
+            event_target_options = [label for label in available if label != event_source_label]
+            target_labels = st.multiselect(
+                "Response target variables",
+                event_target_options,
+                default=event_target_options,
+                key="event_targets_v17",
+                help="Run the same event definition against every selected target. The table covers all targets; choose one below for the detailed response charts.",
+            )
+            if not target_labels:
+                st.info("Select at least one response target different from the event-defining variable.")
             else:
-                st.markdown("**Question:** after a defined increase or decrease in the main variable, did the target's later behaviour differ from its ordinary non-event response?")
-                st.caption("Formation window = how many observations are used to measure the main-variable move ending on the event date. Response horizon = how many target observations forward from that event date are measured. They are separate settings.")
-                target_label = st.selectbox("Target whose response is measured", comparison_labels, key="event_target_v11")
+                st.markdown("**Question:** after a defined increase or decrease in the event variable, did each selected target's later behaviour differ from its ordinary non-event response?")
+                st.caption("Formation window = observations used to measure the event-variable move ending on the event date. Response horizon = target observations forward from that date. The event variable and response targets are selected independently of the workspace's main variable.")
                 ecols = st.columns(4)
                 with ecols[0]:
                     measurement_window = st.select_slider("Measure main-variable change over", options=[1, 3, 5, 10, 20, 60], value=5, format_func=lambda n: f"{n} observations", key="event_measurement_window_v11")
@@ -885,22 +1038,45 @@ def main() -> None:
                 with ecols[3]:
                     response_label = st.selectbox("Target response units", ["Percentage change", "Absolute change"], index=0, key="event_response_mode_v11")
                 horizons = st.multiselect("Measure response after", [1, 2, 3, 5, 10, 20, 30, 60], default=[1, 3, 5, 20], format_func=lambda n: f"{n} target observations", key="event_horizons_v11")
-                st.warning("Predefine your event threshold and response horizons where possible. The current intervals do not correct for trying many thresholds, horizons or event definitions and then highlighting the most attractive result.")
+                st.warning("Predefine your event threshold and response horizons where possible. Intervals do not correct for trying many thresholds, horizons or event definitions and then highlighting the most attractive result.")
                 if not horizons:
                     st.info("Select at least one response horizon.")
                 else:
-                    summary, event_rows = event_study(
-                        primary, available[target_label], int(measurement_window), float(threshold),
-                        "pct" if primary_change_label == "Percentage change" else "diff",
-                        "pct" if response_label == "Percentage change" else "diff",
-                        horizons, analysis_start, analysis_end,
-                    )
-                    if summary.empty or not (summary["events_detected"] > 0).any():
+                    event_summaries = []
+                    event_rows_all = []
+                    with st.spinner(f"Testing the event against {len(target_labels)} response target(s)…"):
+                        for response_target in target_labels:
+                            target_summary, target_event_rows = event_study(
+                                event_source, available[response_target], int(measurement_window), float(threshold),
+                                "pct" if primary_change_label == "Percentage change" else "diff",
+                                "pct" if response_label == "Percentage change" else "diff",
+                                horizons, analysis_start, analysis_end,
+                            )
+                            if not target_summary.empty:
+                                target_summary = target_summary.copy()
+                                target_summary.insert(0, "response_target", response_target)
+                                event_summaries.append(target_summary)
+                            if not target_event_rows.empty:
+                                target_event_rows = target_event_rows.copy()
+                                target_event_rows.insert(0, "response_target", response_target)
+                                event_rows_all.append(target_event_rows)
+                    summary_all = pd.concat(event_summaries, ignore_index=True) if event_summaries else pd.DataFrame()
+                    event_rows_all = pd.concat(event_rows_all, ignore_index=True) if event_rows_all else pd.DataFrame()
+                    targets_with_events = summary_all.loc[summary_all["events_detected"] > 0, "response_target"].drop_duplicates().tolist() if not summary_all.empty else []
+                    if not targets_with_events:
                         st.info("No historical events met this threshold with matching target observations. Lower the threshold or widen the study period if appropriate.")
                     else:
-                        st.markdown("**Subsequent target responses versus non-event baseline**")
-                        rows_display = summary[["horizon_observations", "primary_direction", "events_detected", "realized_responses", "mean_response", "median_response", "positive_response_pct", "block_bootstrap_event_ci_low", "block_bootstrap_event_ci_high", "baseline_observations", "baseline_mean", "block_bootstrap_baseline_ci_low", "block_bootstrap_baseline_ci_high", "mean_difference_vs_baseline", "block_bootstrap_difference_ci_low", "block_bootstrap_difference_ci_high", "bootstrap_valid_replicates", "bootstrap_block_length"]].rename(columns={
-                            "horizon_observations": "Target observations ahead", "primary_direction": "Primary event", "events_detected": "Events found", "realized_responses": "Event responses available", "mean_response": "Event mean response", "median_response": "Event median response", "positive_response_pct": "Event responses positive (%)", "block_bootstrap_event_ci_low": "Event mean CI low", "block_bootstrap_event_ci_high": "Event mean CI high", "baseline_observations": "Baseline responses available", "baseline_mean": "Non-event baseline mean", "block_bootstrap_baseline_ci_low": "Baseline mean CI low", "block_bootstrap_baseline_ci_high": "Baseline mean CI high", "mean_difference_vs_baseline": "Event minus baseline", "block_bootstrap_difference_ci_low": "Difference CI low", "block_bootstrap_difference_ci_high": "Difference CI high", "bootstrap_valid_replicates": "Valid bootstrap samples", "bootstrap_block_length": "Bootstrap block length",
+                        target_to_plot = st.selectbox(
+                            "Target to show in detailed charts",
+                            targets_with_events,
+                            key="event_plot_target_v17",
+                            help="All selected targets are analysed and included in the results table. This selector only chooses which target's curves and event rows are shown below.",
+                        )
+                        summary = summary_all[summary_all["response_target"] == target_to_plot].copy()
+                        event_rows = event_rows_all[event_rows_all["response_target"] == target_to_plot].copy() if not event_rows_all.empty else pd.DataFrame()
+                        st.markdown("**Subsequent responses for all selected targets versus their non-event baselines**")
+                        rows_display = summary_all[["response_target", "horizon_observations", "primary_direction", "events_detected", "realized_responses", "mean_response", "median_response", "positive_response_pct", "block_bootstrap_event_ci_low", "block_bootstrap_event_ci_high", "baseline_observations", "baseline_mean", "block_bootstrap_baseline_ci_low", "block_bootstrap_baseline_ci_high", "mean_difference_vs_baseline", "block_bootstrap_difference_ci_low", "block_bootstrap_difference_ci_high", "bootstrap_valid_replicates", "bootstrap_block_length"]].rename(columns={
+                            "response_target": "Response target", "horizon_observations": "Target observations ahead", "primary_direction": "Event direction", "events_detected": "Events found", "realized_responses": "Event responses available", "mean_response": "Event mean response", "median_response": "Event median response", "positive_response_pct": "Event responses positive (%)", "block_bootstrap_event_ci_low": "Event mean CI low", "block_bootstrap_event_ci_high": "Event mean CI high", "baseline_observations": "Baseline responses available", "baseline_mean": "Non-event baseline mean", "block_bootstrap_baseline_ci_low": "Baseline mean CI low", "block_bootstrap_baseline_ci_high": "Baseline mean CI high", "mean_difference_vs_baseline": "Event minus baseline", "block_bootstrap_difference_ci_low": "Difference CI low", "block_bootstrap_difference_ci_high": "Difference CI high", "bootstrap_valid_replicates": "Valid bootstrap samples", "bootstrap_block_length": "Bootstrap block length",
                         })
                         st.dataframe(rows_display, use_container_width=True, hide_index=True)
                         response_fig = go.Figure()
@@ -1002,83 +1178,119 @@ def main() -> None:
                         st.caption("The dashed baseline is the mean target response on matched dates when the primary-variable threshold was not crossed. Error bars on the difference graph are 95% circular moving-block-bootstrap intervals that preserve contiguous matched-date blocks, approximately accounting for local dependence and overlapping horizons. They remain exploratory; threshold/horizon selection and multiple testing are not corrected.")
 
         else:
-            if not comparison_labels:
-                st.info("Add a comparison series to test lead/lag timing.")
+            lag_source_label = st.selectbox(
+                "Variable whose timing you want to test",
+                list(available),
+                index=list(available).index(primary_label) if primary_label in available else 0,
+                key="lag_source_v17",
+                help="Choose any loaded series as the reference. This is independent of the workspace's main variable.",
+            )
+            lag_source = available[lag_source_label]
+            lag_target_options = [label for label in available if label != lag_source_label]
+            lag_targets = st.multiselect(
+                "Compare timing against these variables",
+                lag_target_options,
+                default=lag_target_options,
+                key="lag_targets_v17",
+                help="Each selected comparison gets its own lead/lag curve and results table. Across-variable adjusted p-values account conservatively for testing multiple comparisons.",
+            )
+            if not lag_targets:
+                st.info("Select at least one comparison variable different from the reference variable.")
             else:
-                compared = st.selectbox("Compare timing with", comparison_labels, key="lag_target_v14")
                 lcols = st.columns(3)
                 with lcols[0]:
-                    window = st.select_slider("Change-formation window", options=[1, 3, 5, 10, 20, 60], value=5, format_func=lambda n: f"{n} observations", key="lag_window_v14", help="Each variable's change is calculated over this many of its observations before matching dates.")
+                    window = st.select_slider("Change-formation window", options=[1, 3, 5, 10, 20, 60], value=5, format_func=lambda n: f"{n} observations", key="lag_window_v17", help="Each variable's change is calculated over this many observations before matching dates.")
                 with lcols[1]:
-                    transform_label = st.selectbox("Change measure", ["Percentage change", "Absolute change"], index=0, key="lag_transform_v14")
+                    transform_label = st.selectbox("Change measure", ["Percentage change", "Absolute change"], index=0, key="lag_transform_v17")
                 with lcols[2]:
-                    max_lag = st.select_slider("Test offsets up to", options=[1, 2, 3, 5, 10], value=5, format_func=lambda n: f"±{n} windows ({n * window} observations)", key="lag_max_v14", help="Lags are spaced by a full change window. This avoids testing adjacent overlapping multi-observation return windows. For a 5-observation window, offsets are 0, ±5, ±10, and so on.")
-                st.caption(f"Interpretation: each series' change is measured over {window} observations. The comparison series is then aligned {window} observations earlier/later at each step, so the price intervals are adjacent rather than overlapping. Offsets count matched observations, not guaranteed calendar days.")
-                result = lead_lag_statistics(
-                    primary, available[compared], int(window),
-                    "pct" if transform_label == "Percentage change" else "diff",
-                    int(max_lag), analysis_start, analysis_end,
-                )
-                lag_fig = go.Figure()
-                lag_low = pd.to_numeric(result["ci_low"], errors="coerce")
-                lag_high = pd.to_numeric(result["ci_high"], errors="coerce")
-                lag_fig.add_trace(go.Scatter(x=result["lag_observations"], y=lag_low, mode="lines", line={"width": 0}, showlegend=False, hoverinfo="skip", name="Block bootstrap lower bound"))
-                lag_fig.add_trace(go.Scatter(x=result["lag_observations"], y=lag_high, mode="lines", line={"width": 0}, fill="tonexty", fillcolor="rgba(56, 189, 248, 0.15)", showlegend=True, name="95% moving-block-bootstrap interval", hoverinfo="skip"))
-                lag_fig.add_trace(go.Scatter(
-                    x=result["lag_observations"], y=result["correlation"], mode="lines+markers",
-                    line={"color": "#38BDF8", "width": 2}, marker={"size": 7}, name="Correlation by lag",
-                    customdata=np.column_stack([result["observations"], lag_low, lag_high, result["familywise_adjusted_p_value"]]),
-                    hovertemplate="Offset: %{x} matched observations<br>Correlation: %{y:.3f}<br>Block-bootstrap interval: %{customdata[1]:.3f} to %{customdata[2]:.3f}<br>Matched pairs: %{customdata[0]}<br>Family-wise adjusted p: %{customdata[3]:.3f}<extra></extra>",
-                ))
-                lag_fig.add_vline(x=0, line_dash="dash", line_color="#F59E0B")
-                lag_fig.add_hline(y=0, line_dash="dot", line_color="#94A3B8")
-                valid_corr = pd.to_numeric(result["correlation"], errors="coerce").dropna()
-                valid_bounds = pd.concat([lag_low, lag_high, valid_corr], ignore_index=True).dropna()
-                full_lag_scale = st.checkbox("Use full correlation scale (−1 to +1)", value=False, key="lag_full_scale_v14")
-                if full_lag_scale or valid_bounds.empty:
-                    y_range = [-1, 1]
+                    max_lag = st.select_slider("Test offsets up to", options=[1, 2, 3, 5, 10], value=5, format_func=lambda n: f"±{n} windows ({n * window} observations)", key="lag_max_v17", help="Lags are spaced by a full change window, reducing overlap between the compared change intervals.")
+                st.caption(f"Reference variable: {lag_source_label}. Each comparison is tested separately at offsets spaced by {window} observations. A negative offset means the comparison series is earlier relative to the reference under the displayed alignment convention; it is not a guaranteed calendar-day lead.")
+                lag_results = {}
+                lag_table_parts = []
+                summary_records = []
+                with st.spinner(f"Testing lead/lag timing against {len(lag_targets)} variable(s)…"):
+                    for compared in lag_targets:
+                        result = lead_lag_statistics(
+                            lag_source, available[compared], int(window),
+                            "pct" if transform_label == "Percentage change" else "diff",
+                            int(max_lag), analysis_start, analysis_end,
+                        ).copy()
+                        result.insert(0, "comparison_variable", compared)
+                        pvals = pd.to_numeric(result["familywise_adjusted_p_value"], errors="coerce")
+                        result["adjusted_p_across_variables"] = (pvals * len(lag_targets)).clip(upper=1.0)
+                        lag_table_parts.append(result)
+                        lag_results[compared] = result
+                        usable = result.dropna(subset=["correlation"])
+                        if not usable.empty:
+                            peak = usable.loc[usable["correlation"].abs().idxmax()]
+                            raw_p = peak.get("familywise_adjusted_p_value")
+                            across_p = peak.get("adjusted_p_across_variables")
+                            summary_records.append({
+                                "Comparison variable": compared,
+                                "Peak absolute correlation": float(peak["correlation"]),
+                                "Offset (observations)": int(peak["lag_observations"]),
+                                "Within-variable adjusted p": raw_p,
+                                "Across-variable adjusted p": across_p,
+                                "Matched pairs at peak": int(peak["observations"]),
+                            })
+                all_lags = pd.concat(lag_table_parts, ignore_index=True) if lag_table_parts else pd.DataFrame()
+                if all_lags.empty:
+                    st.info("The selected series do not have enough matched observations for lead/lag analysis.")
                 else:
-                    low_edge, high_edge = float(valid_bounds.min()), float(valid_bounds.max())
-                    pad = max((high_edge - low_edge) * 0.20, 0.03)
-                    y_range = [max(-1, low_edge - pad), min(1, high_edge + pad)]
-                lag_fig.update_layout(
-                    title=f"Lead/lag association · {window}-observation change windows · non-overlapping tested offsets",
-                    xaxis_title="Comparison-series offset in matched observations (negative = earlier, positive = later)",
-                    yaxis_title="Pearson correlation", yaxis={"range": y_range}, height=430,
-                    margin={"l": 60, "r": 25, "t": 65, "b": 80},
-                    paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", font={"color": "#D9E2F0", "size": 11},
-                    legend={"orientation": "h", "y": 1.12},
-                )
-                lag_fig.update_xaxes(gridcolor="rgba(154, 167, 186, 0.16)", dtick=window)
-                lag_fig.update_yaxes(gridcolor="rgba(154, 167, 186, 0.16)")
-                st.plotly_chart(lag_fig, use_container_width=True, theme=None, config={"displaylogo": False})
-                lag_table = result[["lag_observations", "correlation", "ci_low", "ci_high", "familywise_adjusted_p_value", "observations"]].rename(columns={
-                    "lag_observations": "Offset (matched observations)", "correlation": "Pearson r",
-                    "ci_low": "Block-bootstrap 2.5%", "ci_high": "Block-bootstrap 97.5%",
-                    "familywise_adjusted_p_value": "Family-wise adjusted p", "observations": "Matched pairs",
-                })
-                st.dataframe(lag_table, use_container_width=True, hide_index=True)
-                usable = result.dropna(subset=["correlation"])
-                if not usable.empty:
-                    peak = usable.loc[usable["correlation"].abs().idxmax()]
-                    lag = int(peak["lag_observations"])
-                    direction = "earlier" if lag < 0 else "later" if lag > 0 else "at the same matched observation"
-                    peak_value = float(peak["correlation"])
-                    ci_low, ci_high = peak.get("ci_low"), peak.get("ci_high")
-                    adjusted_p = peak.get("familywise_adjusted_p_value")
-                    if adjusted_p is None or pd.isna(adjusted_p):
-                        st.warning(f"The largest absolute correlation was {peak_value:.3f} at offset {lag} ({direction}), but there were not enough valid circular shifts to assess the tested-lag family. Treat the peak as descriptive only.")
-                    elif float(adjusted_p) >= 0.05:
-                        st.info(f"The largest absolute correlation was {peak_value:.3f} at offset {lag} ({direction}). Its family-wise circular-shift adjusted p-value is {float(adjusted_p):.3f}, which does not meet the conventional 0.05 threshold after accounting for the search across {int(peak['tested_lags_count'])} offsets. This is not evidence of a reliable lead/lag effect.")
+                    lag_fig = go.Figure()
+                    for compared, result in lag_results.items():
+                        result = result.sort_values("lag_observations")
+                        lag_low = pd.to_numeric(result["ci_low"], errors="coerce")
+                        lag_high = pd.to_numeric(result["ci_high"], errors="coerce")
+                        lag_fig.add_trace(go.Scatter(
+                            x=result["lag_observations"], y=result["correlation"], mode="lines+markers", name=compared,
+                            error_y={
+                                "type": "data", "symmetric": False,
+                                "array": (lag_high - pd.to_numeric(result["correlation"], errors="coerce")).clip(lower=0).fillna(0),
+                                "arrayminus": (pd.to_numeric(result["correlation"], errors="coerce") - lag_low).clip(lower=0).fillna(0),
+                                "visible": True,
+                            },
+                            customdata=np.column_stack([
+                                result["observations"], result["adjusted_p_across_variables"], result["familywise_adjusted_p_value"]
+                            ]),
+                            hovertemplate=f"Variable: {compared}<br>Offset: %{{x}} matched observations<br>Correlation: %{{y:.3f}}<br>Matched pairs: %{{customdata[0]}}<br>Adjusted p within variable: %{{customdata[2]:.3f}}<br>Adjusted p across selected variables: %{{customdata[1]:.3f}}<extra></extra>",
+                        ))
+                    lag_fig.add_vline(x=0, line_dash="dash", line_color="#F59E0B")
+                    lag_fig.add_hline(y=0, line_dash="dot", line_color="#94A3B8")
+                    full_lag_scale = st.checkbox("Use full correlation scale (−1 to +1)", value=False, key="lag_full_scale_v17")
+                    if full_lag_scale:
+                        y_range = [-1, 1]
                     else:
-                        st.warning(f"The largest absolute correlation was {peak_value:.3f} at offset {lag} ({direction}); its family-wise circular-shift adjusted p-value is {float(adjusted_p):.3f}. This is a candidate association under the circular-shift/stationarity assumptions, not proof of prediction or causation. Confirm it on a pre-specified untouched period.")
-                    if ci_low is not None and ci_high is not None and not pd.isna(ci_low) and not pd.isna(ci_high):
-                        st.caption(f"Moving-block-bootstrap 95% interval at this selected peak: {float(ci_low):.3f} to {float(ci_high):.3f}. Because the peak was selected from the tested offsets, use the family-wise adjusted p-value for the search-level assessment, not the pointwise interval alone.")
-                if int(result["null_shift_replicates"].max()) == 0:
-                    st.warning("The study period is too short relative to the requested lag range for the circular-shift test. Reduce the number of offsets or widen the study period.")
-                if result["ci_low"].isna().all():
-                    st.warning("The moving-block-bootstrap interval is unavailable: the sample cannot support at least three blocks long enough to cover the largest tested lag and formation window. Reduce the tested lag span or formation window, or widen the study period.")
-                st.caption("Intervals use a moving-block bootstrap of paired changes to approximately preserve local serial dependence. Family-wise adjusted p-values compare each lag against the maximum absolute correlation under circular shifts, controlling the search over the tested offsets if the change process is sufficiently stationary. This is not a multiple-variable correction and not a causal test. Choose lags before inspecting results wherever possible.")
+                        vals = pd.to_numeric(all_lags["correlation"], errors="coerce").dropna()
+                        if vals.empty:
+                            y_range = [-1, 1]
+                        else:
+                            lo, hi = float(vals.min()), float(vals.max())
+                            pad = max((hi - lo) * 0.2, 0.03)
+                            y_range = [max(-1, lo - pad), min(1, hi + pad)]
+                    lag_fig.update_layout(
+                        title=f"Lead/lag association · {window}-observation changes · {len(lag_targets)} comparison variable(s)",
+                        xaxis_title="Comparison-series offset in matched observations",
+                        yaxis_title="Pearson correlation", yaxis={"range": y_range}, height=460,
+                        margin={"l": 60, "r": 25, "t": 65, "b": 80},
+                        paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", font={"color": "#D9E2F0", "size": 11},
+                        legend={"orientation": "h", "y": 1.12},
+                    )
+                    lag_fig.update_xaxes(gridcolor="rgba(154, 167, 186, 0.16)", dtick=window)
+                    lag_fig.update_yaxes(gridcolor="rgba(154, 167, 186, 0.16)")
+                    st.plotly_chart(lag_fig, use_container_width=True, theme=None, config={"displaylogo": False})
+                    if summary_records:
+                        st.markdown("**Strongest tested offset for each comparison**")
+                        st.dataframe(pd.DataFrame(summary_records).sort_values("Across-variable adjusted p", na_position="last"), use_container_width=True, hide_index=True)
+                    display_lags = all_lags[["comparison_variable", "lag_observations", "correlation", "ci_low", "ci_high", "observations", "familywise_adjusted_p_value", "adjusted_p_across_variables"]].rename(columns={
+                        "comparison_variable": "Comparison variable", "lag_observations": "Offset (matched observations)",
+                        "correlation": "Pearson r", "ci_low": "Block-bootstrap 2.5%", "ci_high": "Block-bootstrap 97.5%",
+                        "observations": "Matched pairs", "familywise_adjusted_p_value": "Adjusted p within variable",
+                        "adjusted_p_across_variables": "Adjusted p across variables",
+                    })
+                    with st.expander("All tested offsets and uncertainty", expanded=False):
+                        st.dataframe(display_lags, use_container_width=True, hide_index=True)
+                    st.caption("Within-variable adjusted p-values account for searching tested offsets for that pair using the circular-shift max-statistic. The across-variable column applies a conservative Bonferroni adjustment to those pair-level results for the number of selected comparisons. Validity still depends on the method's time-series assumptions; this is association testing, not causation or a guaranteed trading signal.")
 
     with data_tab:
         chosen = st.selectbox("Show observations for", list(available), key="raw_series_selection")

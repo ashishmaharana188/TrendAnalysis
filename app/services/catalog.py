@@ -16,13 +16,22 @@ from data_access.institutional import get_institutional_flow_history
 from data_access.macro_global import get_global_assets, get_macro_indicators
 from data_access.metadata import get_active_companies
 from data_access.query import execute_rows
+from .derivative_filters import (
+    COMMODITY_FUTURES_SQL,
+    COMMODITY_OPTIONS_SQL,
+    STOCK_INDEX_FUTURES_SQL,
+    STOCK_INDEX_OPTIONS_SQL,
+)
 
 
 SOURCE_MARKET = "Market asset / company price"
 SOURCE_MACRO = "Macro / global indicator"
 SOURCE_MATRIX = "Derivatives & microstructure matrix"
-SOURCE_OPTIONS = "Options aggregates"
-SOURCE_BASIS = "Futures basis"
+SOURCE_OPTIONS = "Stock/index options contracts"
+SOURCE_COMMODITY_OPTIONS = "Commodity options contracts"
+SOURCE_FUTURES = "Stock/index futures contracts"
+SOURCE_COMMODITY_FUTURES = "Commodity futures contracts"
+SOURCE_BASIS = "Stock/index spot-futures basis"
 SOURCE_INSTITUTIONAL = "Institutional flows"
 SOURCE_Q_INCOME = "Quarterly income statement"
 SOURCE_Y_INCOME = "Yearly income statement"
@@ -37,6 +46,9 @@ SOURCES = [
     SOURCE_MACRO,
     SOURCE_MATRIX,
     SOURCE_OPTIONS,
+    SOURCE_COMMODITY_OPTIONS,
+    SOURCE_FUTURES,
+    SOURCE_COMMODITY_FUTURES,
     SOURCE_BASIS,
     SOURCE_INSTITUTIONAL,
     SOURCE_Q_INCOME,
@@ -98,6 +110,19 @@ OPTIONS_METRICS = [
     Metric("volume_pcr", "Volume put/call ratio"),
 ]
 
+# Raw futures contracts are read directly from unified_market_master. One
+# representative contract is selected per date (highest OI; earlier expiry breaks ties).
+FUTURES_CONTRACT_METRICS = [
+    Metric("close", "Futures close price"),
+    Metric("volume", "Futures volume"),
+    Metric("open_interest", "Open interest"),
+    Metric("change_in_oi", "Change in open interest"),
+    Metric("settlement_price", "Settlement price"),
+    Metric("underlying_price", "Recorded underlying price"),
+    Metric("absolute_basis", "Futures minus recorded underlying price"),
+    Metric("basis_percentage", "Basis as % of recorded underlying price"),
+]
+
 BASIS_METRICS = [
     Metric("spot_price", "Spot price"),
     Metric("futures_price", "Futures price"),
@@ -105,6 +130,16 @@ BASIS_METRICS = [
     Metric("absolute_basis", "Absolute basis"),
     Metric("basis_percentage", "Basis percentage"),
 ]
+
+# The raw catalogue and history loader share exact instrument-code filters.
+# In particular, FUTCOM must not depend on a matching cash-equity row, and
+# OPTFUT must not leak into the futures source if an option-side field is dirty.
+RAW_DERIVATIVE_FILTERS = {
+    SOURCE_OPTIONS: STOCK_INDEX_OPTIONS_SQL,
+    SOURCE_COMMODITY_OPTIONS: COMMODITY_OPTIONS_SQL,
+    SOURCE_FUTURES: STOCK_INDEX_FUTURES_SQL,
+    SOURCE_COMMODITY_FUTURES: COMMODITY_FUTURES_SQL,
+}
 
 INSTITUTIONAL_METRICS = [
     # Raw daily ledger fields.
@@ -197,8 +232,10 @@ def metric_options(source: str) -> list[Metric]:
         return PRICE_METRICS
     if source == SOURCE_MATRIX:
         return MATRIX_METRICS
-    if source == SOURCE_OPTIONS:
+    if source in (SOURCE_OPTIONS, SOURCE_COMMODITY_OPTIONS):
         return OPTIONS_METRICS
+    if source in (SOURCE_FUTURES, SOURCE_COMMODITY_FUTURES):
+        return FUTURES_CONTRACT_METRICS
     if source == SOURCE_BASIS:
         return BASIS_METRICS
     if source == SOURCE_INSTITUTIONAL:
@@ -238,12 +275,38 @@ def list_identifiers(source: str) -> list[dict[str, str]]:
             for ticker, latest in sorted(latest_by_ticker.items(), key=lambda item: item[0].casefold())
         ]
 
-    # These selectors must be sourced from the same views that supply their
-    # plotted observations. Listing all global assets caused invalid choices
-    # for options, futures and the precomputed derivatives/microstructure view.
+    # Raw F&O identifiers are sourced from the same contract table and filters
+    # used by the series loader, not from a generic list of market tickers.
+    if source in RAW_DERIVATIVE_FILTERS:
+        predicate = RAW_DERIVATIVE_FILTERS[source]
+        sql = f"""
+            SELECT
+                "Ticker",
+                MAX("ReportDate") AS latest_date,
+                COUNT(*) AS record_count,
+                STRING_AGG(DISTINCT CAST("InstrumentType" AS VARCHAR), ', ' ORDER BY CAST("InstrumentType" AS VARCHAR)) AS instrument_types
+            FROM unified_market_master
+            WHERE "Ticker" IS NOT NULL AND TRIM(CAST("Ticker" AS VARCHAR)) <> ''
+              AND {predicate}
+            GROUP BY "Ticker"
+            ORDER BY "Ticker"
+        """
+        rows = execute_rows(sql)
+        choices = []
+        for ticker, latest, count, instrument_types in rows:
+            ticker_text = str(ticker or "").strip()
+            if not ticker_text:
+                continue
+            latest_text = latest.isoformat() if hasattr(latest, "isoformat") else str(latest or "")
+            types_text = str(instrument_types or "listed contracts")
+            label = f"{ticker_text} · {types_text} · latest {latest_text} · {int(count or 0):,} records"
+            choices.append({"value": ticker_text, "label": label})
+        return choices
+
+    # Legacy spot-linked view is retained separately: it requires matching cash
+    # rows and does not represent most commodity futures.
     catalogue_queries = {
         SOURCE_MATRIX: ("mv_unified_market_matrix", "date"),
-        SOURCE_OPTIONS: ("mv_options_aggregates", "ReportDate"),
         SOURCE_BASIS: ("mv_spot_futures_basis", "ReportDate"),
     }
     if source in catalogue_queries:
@@ -284,6 +347,39 @@ def list_identifiers(source: str) -> list[dict[str, str]]:
         return [{"value": item, "label": item} for item in values]
 
     return []
+
+
+def commodity_contract_coverage() -> list[dict[str, Any]]:
+    """Summarize raw commodity F&O coverage for in-app diagnostics.
+
+    This reads the raw contract table directly and does not depend on the
+    equity-linked materialized futures-basis view.
+    """
+    sql = """
+        SELECT
+            UPPER(TRIM(CAST("InstrumentType" AS VARCHAR))) AS instrument_type,
+            UPPER(TRIM(COALESCE(CAST("OptionType" AS VARCHAR), 'XX'))) AS option_type,
+            COUNT(*) AS record_count,
+            COUNT(DISTINCT "Ticker") AS ticker_count,
+            MIN("ReportDate") AS first_date,
+            MAX("ReportDate") AS latest_date
+        FROM unified_market_master
+        WHERE UPPER(TRIM(COALESCE(CAST("InstrumentType" AS VARCHAR), ''))) IN ('FUTCOM', 'OPTFUT', 'OPTCOM')
+        GROUP BY 1, 2
+        ORDER BY 1, 2
+    """
+    rows = execute_rows(sql)
+    result: list[dict[str, Any]] = []
+    for instrument_type, option_type, record_count, ticker_count, first_date, latest_date in rows:
+        result.append({
+            "instrument_type": str(instrument_type or ""),
+            "option_type": str(option_type or "XX"),
+            "records": int(record_count or 0),
+            "tickers": int(ticker_count or 0),
+            "first_date": first_date.isoformat() if hasattr(first_date, "isoformat") else str(first_date or ""),
+            "latest_date": latest_date.isoformat() if hasattr(latest_date, "isoformat") else str(latest_date or ""),
+        })
+    return result
 
 
 def get_financial_loader(source: str):

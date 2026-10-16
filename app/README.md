@@ -70,11 +70,15 @@ This update replaces files inside `app/` only. Before extracting it over an exis
 - Market-price loading in the app checks the canonical ticker and its `.NS` alias, then chooses the alias with the latest non-null closing observation. This fix is scoped to `/app`; it does not change `data_access/market.py`, which the existing backtest/prediction code also uses.
 - Series cache lifetime is 60 seconds. Use **Refresh available data** to clear cached catalogues and series immediately.
 - The workspace's **Data coverage and how each series is built** panel shows the first/latest loaded observations, row counts in the chart range, and the construction rule for each series. Recent daily series with no observations for more than five calendar days are flagged for inspection.
-- Options PCR is calculated per date as the sum of put OI divided by the sum of call OI across expiry rows returned for that ticker/date. Volume PCR uses summed put and call volume.
-- Futures-basis panels represent the expiry with the highest recorded open interest on each date. The represented expiry may change from date to date.
+- Stock/index options and commodity options are selected from raw `unified_market_master` contract rows using their own instrument-type filters. The selected ticker is used in the history query, so the chart cannot fall back to an unrelated first ticker.
+- Underlying-level options PCR is calculated per date by summing eligible CE/PE open interest (or volume) across available strikes and expiry dates for the exact selected ticker. This is not a single-strike or single-expiry options chart.
+- Stock/index futures and commodity futures are selected from raw `unified_market_master` rows. One contract is represented per date: highest open interest, with earlier expiry as tie-breaker. The expiry can change over time; basis against the recorded underlying price is only calculated when that source field is populated.
+- The legacy stock/index spot-futures basis view remains separate because it requires a matching cash-market row and cannot represent most commodity contracts.
+- F&O pickers first attempt an exact underlying-ticker match with the main series (ignoring `.NS` / `.BO` suffixes). If none exists, the UI asks the user to choose a traded underlying explicitly rather than selecting an unrelated ticker by default. Economic aliases such as `Brent_Crude` → `CRUDEOIL` are not silently guessed.
+- Commodity futures/options will appear only when the relevant raw contract records exist in `unified_market_master`. The app does not ingest missing MCX/commodity records; those must be supplied by the upstream ETL/data source.
 - Trading-activity fields come from the ETL-produced `mv_unified_market_matrix` and are plotted as stored values.
 - Institutional selection is by client category. Raw ledger measures (cash, long/short positions and contract counts) come from `institutional_ledger`; derived net/change measures come from `mv_institutional_flow`.
-- Options, futures and trading-activity pickers list instruments from their own source views rather than reusing the general market-price catalogue.
+- Options and raw futures pickers list instruments from `unified_market_master` with the exact instrument-type filters used by the history loader. The legacy basis picker lists only tickers present in `mv_spot_futures_basis`; the trading-activity picker lists tickers present in `mv_unified_market_matrix`.
 
 ## Terminal-style linked chart grid
 
@@ -139,3 +143,13 @@ The statistical interval methods are deliberately labelled approximate. The lead
 - Pairwise and rolling correlations now use a Bartlett-style effective sample size estimated from autocorrelation products across short lags, extending the range to reflect overlapping return windows when enough observations exist. This is an approximate adjustment, not an exact correction.
 - Event analysis distinguishes the primary-variable formation window from the target response horizon and warns that trying multiple thresholds/horizons and then selecting a favourable result is a multiple-testing problem.
 - The scatter view provides a table of unusual matched observations based on robust median/MAD deviations. These points are flagged for inspection, never silently removed.
+
+
+### Commodity futures and options
+
+Commodity futures/options are loaded directly from raw `unified_market_master` contract rows, separate from the equity-linked futures-basis table. Instrument filters explicitly recognise `FUTCOM` as commodity futures and `OPTFUT` / `OPTCOM` CE/PE rows as commodity options. Use the **MCX / commodity raw-data coverage** panel in the selector to inspect actual instrument-type counts and date coverage. See [`COMMODITY_DERIVATIVES.md`](COMMODITY_DERIVATIVES.md) for the inventory query and interpretation notes.
+
+
+## Multi-variable Event Study and Lead/Lag (v17)
+
+Event Study now lets you select an event-defining series independently from the workspace reference and run the same event definition against multiple response targets. A target selector controls the detailed charts; the results table includes every selected target. Lead/Lag similarly lets you choose a reference series and multiple comparison series, overlay their lag curves, and inspect per-variable results. Within-variable p-values adjust over tested offsets; an additional conservative Bonferroni adjustment accounts for the number of selected comparisons. These controls do not imply causal identification.
