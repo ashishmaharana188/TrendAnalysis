@@ -39,9 +39,21 @@ def _series_frame(df: pd.DataFrame, date_col: str, value_col: str, label: str) -
     value_name = _col(df, value_col)
     if df.empty or date_name is None or value_name is None:
         return _empty_series()
-    result = df[[date_name, value_name]].rename(columns={date_name: "date", value_name: "value"}).copy()
+    # Preserve candle fields for the terminal's fixed OHLC/date readout.
+    # Not every source has OHLC (e.g. PCR, institutional flows, financials),
+    # so these fields remain optional and are never manufactured.
+    result = pd.DataFrame({
+        "date": df[date_name].to_numpy(copy=True),
+        "value": df[value_name].to_numpy(copy=True),
+    })
+    for field in ("open", "high", "low", "close", "volume"):
+        source_column = _col(df, field)
+        if source_column is not None:
+            result[field] = df[source_column].to_numpy(copy=True)
     result["date"] = pd.to_datetime(result["date"], errors="coerce")
-    result["value"] = pd.to_numeric(result["value"], errors="coerce")
+    for column in ("value", "open", "high", "low", "close", "volume"):
+        if column in result.columns:
+            result[column] = pd.to_numeric(result[column], errors="coerce")
     result = result.replace([np.inf, -np.inf], np.nan).dropna(subset=["date", "value"])
     result = result.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
     result.attrs["label"] = label

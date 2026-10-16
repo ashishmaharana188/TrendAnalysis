@@ -8,10 +8,14 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+import numpy as np
 import pandas as pd
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import streamlit as st
+import streamlit.components.v1 as components
 
-from app.components.charts import synchronized_series_chart
+from app.components.charts import synchronized_series_chart, terminal_chart_html
 from app.services.catalog import (
     FINANCIAL_METRICS,
     SOURCE_BASIS,
@@ -26,11 +30,18 @@ from app.services.catalog import (
 )
 from app.services.series_service import load_series, series_construction_note
 from app.services.statistics_service import (
+    correlation_matrix,
+    distribution_frame,
+    distribution_interpretation,
+    distribution_summary,
     event_study,
     lead_lag_statistics,
     pair_statistics,
+    paired_change_data,
+    rolling_pair_correlation,
     variable_summary,
 )
+from app.services.indicators import calculate_indicators
 from app.services.time_ranges import normalize_date_range, subtract_period
 from data_access.db import get_db_path
 
@@ -109,6 +120,23 @@ def _format_value(value, suffix: str = "") -> str:
         return f"{float(value):,.3f}{suffix}"
     except (TypeError, ValueError):
         return "Not available"
+
+
+def _heatmap_tick_label(label: str) -> str:
+    """Short, readable two-line heatmap tick label; full name stays in hover."""
+    parts = [part.strip() for part in str(label).split(" · ") if part.strip()]
+    if len(parts) >= 3:
+        identifier = parts[-2].replace("_", " ")
+        measure = parts[-1].replace("_", " ")
+    elif len(parts) == 2:
+        identifier, measure = parts[0].replace("_", " "), parts[1].replace("_", " ")
+    else:
+        identifier, measure = (parts[0].replace("_", " ") if parts else "Series"), ""
+    if len(identifier) > 22:
+        identifier = identifier[:19].rstrip() + "…"
+    if len(measure) > 20:
+        measure = measure[:17].rstrip() + "…"
+    return f"{identifier}<br>{measure}" if measure else identifier
 
 
 def _request_from_entry(entry: dict[str, str]) -> SeriesRequest:
@@ -412,85 +440,610 @@ def main() -> None:
     stat_cols = st.columns(4)
     stat_cols[0].metric("Latest observation", str(primary_stats.get("latest_date") or "Not available"))
     stat_cols[1].metric("Latest value", _format_value(primary_stats.get("latest_value")))
-    stat_cols[2].metric("Change over chart period", _format_value(primary_stats.get("change")))
-    stat_cols[3].metric("Change over chart period (%)", _format_value(primary_stats.get("percent_change"), "%"))
+    stat_cols[2].metric("First-to-last change", _format_value(primary_stats.get("change")))
+    pct_label = _format_value(primary_stats.get("percent_change"), "%") if primary_stats.get("percent_change_available") else "N/A"
+    stat_cols[3].metric("First-to-last change (%)", pct_label)
+    if primary_stats.get("observations", 0):
+        st.caption(
+            "Change is the last valid observed value minus the first valid observed value inside the selected chart dates, "
+            f"not the sum of daily changes. Start: {primary_stats['first_date']} ({_format_value(primary_stats['first_value'])}); "
+            f"end: {primary_stats['latest_date']} ({_format_value(primary_stats['latest_value'])}). "
+            + ("Percentage change is omitted because the starting value is zero or negative." if not primary_stats.get("percent_change_available") else "Percentage change = (end value ÷ start value − 1) × 100.")
+        )
 
-    chart_tab, analysis_tab, data_tab = st.tabs(["Charts", "Statistical analysis", "Raw data"])
+    chart_tab, distribution_tab, analysis_tab, data_tab = st.tabs(["Charts", "Distribution & variability", "Statistical analysis", "Raw data"])
     with chart_tab:
-        st.subheader("Synchronized charts")
-        st.caption("Each variable has its own panel and units. The panels share a timeline; add as many series as you need.")
-        figure = synchronized_series_chart(available, chart_start, chart_end)
+        title_col, layout_col, sync_col = st.columns([2, 1, 1])
+        with title_col:
+            st.subheader("Market charts")
+        with layout_col:
+            columns_per_row = st.radio(
+                "Charts per row",
+                options=[2, 3],
+                index=0,
+                horizontal=True,
+                key="charts_per_row",
+                help="Choose two or three panels per row. Every panel remains on the same date timeline.",
+            )
+        with sync_col:
+            sync_crosshair = st.checkbox(
+                "Sync crosshair",
+                value=True,
+                key="sync_crosshair",
+                help="Show vertical and horizontal cursor guides on every chart when you hover any one chart.",
+            )
+        st.caption(
+            "Hover to inspect the date and OHLC readout in the top-right. Click a chart to lock the plus crosshair; "
+            "drag it to move the date and value guides. Use Full-screen terminal for all charts or Expand on an individual chart."
+        )
+        indicator_overlays: dict[str, dict[str, pd.DataFrame]] = {}
+        with st.expander("Chart indicators", expanded=False):
+            st.markdown("**Moving averages and volatility bands**")
+            st.caption("These are visual overlays, calculated independently from each chart's own observations. They do not alter source data or imply a trading signal.")
+            indicator_cols = st.columns(3)
+            with indicator_cols[0]:
+                ema_9 = st.checkbox("EMA 9", value=False, key="indicator_ema_9", help="Exponential moving average over 9 observations; recent values receive more weight.")
+                ema_20 = st.checkbox("EMA 20", value=False, key="indicator_ema_20", help="Exponential moving average over 20 observations.")
+            with indicator_cols[1]:
+                sma_20 = st.checkbox("SMA 20", value=False, key="indicator_sma_20", help="Arithmetic mean of the last 20 observations.")
+                sma_50 = st.checkbox("SMA 50", value=False, key="indicator_sma_50", help="Arithmetic mean of the last 50 observations.")
+            with indicator_cols[2]:
+                bollinger = st.checkbox("Bollinger bands 20", value=False, key="indicator_bollinger_20", help="20-observation SMA with bands two rolling standard deviations above and below it.")
+            selected_ema = tuple(period for period, enabled in ((9, ema_9), (20, ema_20)) if enabled)
+            selected_sma = tuple(period for period, enabled in ((20, sma_20), (50, sma_50)) if enabled)
+            if selected_ema or selected_sma or bollinger:
+                for label, frame in available.items():
+                    indicator_overlays[label] = calculate_indicators(
+                        frame,
+                        ema_periods=selected_ema,
+                        sma_periods=selected_sma,
+                        bollinger_period=20 if bollinger else None,
+                    )
+            st.caption("Windows count available observations, not calendar days. The same indicator setting can produce different values on different variables because each is calculated from its own series.")
+        figure = synchronized_series_chart(
+            available,
+            chart_start,
+            chart_end,
+            columns_per_row=columns_per_row,
+            sync_crosshair=sync_crosshair,
+            indicator_overlays=indicator_overlays,
+        )
         if figure is None:
             st.info("No selected observations fall inside the chart history range.")
         else:
-            st.plotly_chart(figure, use_container_width=True)
+            chart_html = terminal_chart_html(figure, sync_crosshair=sync_crosshair)
+            # Keep the terminal at a stable height. Its header stays fixed while
+            # the chart grid scrolls internally, even when many rows are present.
+            components.html(
+                chart_html,
+                height=800,
+                scrolling=False,
+            )
+
+    with distribution_tab:
+        st.subheader("Understand the shape and variability of selected data")
+        st.markdown(
+            "A distribution describes **what values have occurred**, how tightly they cluster, and how often extreme observations appear. "
+            "It does not forecast direction. Choose all series to compare them, or select a subset to keep the plots readable."
+        )
+        distribution_labels = st.multiselect(
+            "Series to include",
+            options=list(available),
+            default=list(available),
+            key="distribution_series_selection",
+            help="Every selected series gets its own panel and numerical summary. Different units are not mixed on one axis.",
+        )
+        distribution_mode_label = st.selectbox(
+            "What should be distributed?",
+            ["Observed values", "Absolute change from previous observation", "Percentage change from previous observation"],
+            index=2,
+            key="distribution_mode_v11",
+            help="For market-price research, start with percentage changes. Use absolute changes for signed flows or series that cross zero.",
+        )
+        distribution_mode_map = {
+            "Observed values": "levels",
+            "Absolute change from previous observation": "absolute_change",
+            "Percentage change from previous observation": "percentage_change",
+        }
+        dist_mode = distribution_mode_map[distribution_mode_label]
+        st.caption(f"Study period: {analysis_start.isoformat()} to {analysis_end.isoformat()}. Change values use the preceding available observation where available, even if it falls just before the displayed study start.")
+        distribution_views: dict[str, pd.DataFrame] = {}
+        distribution_summaries: dict[str, dict] = {}
+        for label in distribution_labels:
+            frame = distribution_frame(available[label], dist_mode, analysis_start, analysis_end)
+            frame = frame.dropna(subset=["value"])
+            distribution_views[label] = frame
+            distribution_summaries[label] = distribution_summary(frame)
+
+        if not distribution_labels:
+            st.info("Select at least one series to inspect its distribution.")
+        else:
+            summary_records = []
+            for label in distribution_labels:
+                stats = distribution_summaries[label]
+                summary_records.append({
+                    "Series": label,
+                    "Observations": stats["observations"],
+                    "Mean": stats["mean"],
+                    "Median": stats["median"],
+                    "Std. deviation": stats["std_dev"],
+                    "5th percentile": stats["p05"],
+                    "25th percentile": stats["p25"],
+                    "75th percentile": stats["p75"],
+                    "95th percentile": stats["p95"],
+                    "Skewness": stats["skewness"],
+                })
+            st.markdown("**Numerical summary**")
+            st.dataframe(pd.DataFrame(summary_records), use_container_width=True, hide_index=True)
+            st.caption(
+                "Mean = arithmetic average; median = middle observation; standard deviation = spread around the mean; "
+                "5th–95th percentiles = central 90% range; skewness describes asymmetry. Compare variables within their own units. "
+                "Percentile and skewness estimates become unreliable with small samples."
+            )
+
+            plot_view = st.radio(
+                "View distribution as",
+                ["Histogram", "Box plot", "Cumulative percentile"],
+                horizontal=True,
+                key="distribution_plot_view_v11",
+                help="Histogram shows counts in value ranges; box plot compares median and spread; cumulative percentile shows the share of observations at or below each value.",
+            )
+            selected_n = len(distribution_labels)
+            grid_cols = 2 if selected_n > 1 else 1
+            grid_rows = int(np.ceil(selected_n / grid_cols))
+            subplot_titles = [label for label in distribution_labels]
+            fig = make_subplots(
+                rows=grid_rows, cols=grid_cols,
+                subplot_titles=subplot_titles,
+                vertical_spacing=min(0.12, 0.28 / max(grid_rows, 1)),
+                horizontal_spacing=0.12 if grid_cols == 2 else 0.04,
+            )
+            for index, label in enumerate(distribution_labels):
+                frame = distribution_views[label]
+                if frame.empty:
+                    continue
+                row = index // grid_cols + 1
+                col = index % grid_cols + 1
+                values = frame["value"].to_numpy(dtype=float)
+                if plot_view == "Histogram":
+                    fig.add_trace(go.Histogram(
+                        x=values,
+                        nbinsx=min(40, max(8, int(np.sqrt(len(values))))),
+                        name=label,
+                        marker={"color": "#38BDF8", "line": {"color": "#0E1117", "width": 0.5}},
+                        showlegend=False,
+                        hovertemplate="Range: %{x}<br>Observations: %{y}<extra></extra>",
+                    ), row=row, col=col)
+                    fig.update_yaxes(title_text="Observation count", rangemode="tozero", row=row, col=col)
+                elif plot_view == "Box plot":
+                    fig.add_trace(go.Box(
+                        y=values, name=label, boxpoints="outliers",
+                        marker={"color": "#38BDF8", "size": 4},
+                        line={"color": "#38BDF8"}, showlegend=False,
+                        hovertemplate="Value: %{y:,.5g}<extra></extra>",
+                    ), row=row, col=col)
+                    value_axis = {
+                        "levels": "Observed value (series units)",
+                        "absolute_change": "Absolute change (series units)",
+                        "percentage_change": "Percentage change (%)",
+                    }[dist_mode]
+                    fig.update_yaxes(title_text=value_axis, row=row, col=col)
+                else:
+                    sorted_values = np.sort(values)
+                    cumulative_pct = np.arange(1, len(sorted_values) + 1) / len(sorted_values) * 100.0
+                    fig.add_trace(go.Scatter(
+                        x=sorted_values, y=cumulative_pct, mode="lines",
+                        line={"color": "#38BDF8", "width": 2}, name=label,
+                        showlegend=False,
+                        hovertemplate="Value: %{x:,.5g}<br>Observations at or below: %{y:.1f}%<extra></extra>",
+                    ), row=row, col=col)
+                    fig.update_yaxes(title_text="Observations at or below (%)", range=[0, 100], row=row, col=col)
+                if plot_view != "Box plot":
+                    fig.update_xaxes(title_text={
+                        "levels": "Observed value (series units)",
+                        "absolute_change": "Absolute change (series units)",
+                        "percentage_change": "Percentage change (%)",
+                    }[dist_mode], row=row, col=col)
+            figure_height = max(340, grid_rows * 300)
+            fig.update_layout(
+                height=figure_height,
+                margin={"l": 45, "r": 20, "t": 55, "b": 40},
+                paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                font={"color": "#D9E2F0", "size": 11},
+                title={"text": f"{plot_view}: {distribution_mode_label}", "font": {"size": 16}},
+                bargap=0.08,
+            )
+            fig.update_xaxes(gridcolor="rgba(154, 167, 186, 0.16)", zeroline=True, zerolinecolor="#5A6573")
+            fig.update_yaxes(gridcolor="rgba(154, 167, 186, 0.16)")
+            st.plotly_chart(fig, use_container_width=True, theme=None, config={"displaylogo": False})
+
+            selected_interpretation = st.selectbox(
+                "Read the interpretation for",
+                distribution_labels,
+                index=distribution_labels.index(primary_label) if primary_label in distribution_labels else 0,
+                key="distribution_interpretation_series_v11",
+            )
+            selected_frame = distribution_views[selected_interpretation]
+            selected_summary = distribution_summaries[selected_interpretation]
+            st.markdown("**What the selected distribution says**")
+            st.write(distribution_interpretation(selected_summary, dist_mode))
+            if int(selected_summary.get("observations") or 0) < 30:
+                st.warning("Fewer than 30 observations: treat shape, tail and skewness descriptions as tentative. The 30-observation guide is a caution, not a universal statistical cutoff.")
+            st.caption("A histogram's height is a count, not a probability of what happens next. The cumulative percentile plot is empirical: it describes this selected historical sample, not a calibrated forecast.")
 
     with analysis_tab:
-        st.subheader("What would you like to check?")
+        st.subheader("Statistical research")
+        guide_path = Path(__file__).with_name("STATISTICAL_GUIDE.md")
+        with st.expander("Open statistical definitions and interpretation guide", expanded=False):
+            if guide_path.exists():
+                st.markdown(guide_path.read_text(encoding="utf-8"))
+            else:
+                st.info("The full statistical guide is not present in this app folder.")
+        st.markdown(
+            "This section measures historical relationships. It does not label a coefficient as universally good or bad: "
+            "interpretation depends on effect size, matched sample, uncertainty, stability and the question being tested."
+        )
+        st.caption(f"Main variable: {primary_label} · Study dates: {analysis_start.isoformat()} to {analysis_end.isoformat()}")
         mode = st.radio(
-            "Analysis",
-            ["How do variables move together?", "What happens after a rise or fall?", "Does one tend to move first?"],
+            "Research question",
+            ["Relationships", "Response after events", "Lead/lag timing"],
             horizontal=True,
             label_visibility="collapsed",
-            key="analysis_mode",
+            key="analysis_mode_v11",
         )
         comparison_labels = [label for label in available if label != primary_label]
-        if not comparison_labels:
-            st.info("Add at least one comparison series to run relationship or response analysis.")
-        elif mode == "How do variables move together?":
-            st.markdown(f"Changes in **{primary_label}** compared with each selected variable over the same dates.")
-            with st.expander("Analysis settings", expanded=False):
-                window = st.select_slider("Measure change over", options=[1, 3, 5, 10, 20, 60], value=5, format_func=lambda n: f"{n} observation{'s' if n != 1 else ''}")
-                transform_label = st.selectbox("Measure changes as", ["Percentage change", "Absolute change"], index=0)
-            transform = "pct" if transform_label == "Percentage change" else "diff"
-            rows = []
-            for label in comparison_labels:
-                result = pair_statistics(primary, available[label], int(window), transform, analysis_start, analysis_end)
-                rows.append({"Compared with": label, "Matched observations": result["observations"], "Pearson correlation": result["pearson"], "Spearman correlation": result["spearman"], "OLS slope": result["slope"]})
-            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-            st.caption("Correlations use changes, not raw price levels. They describe association, not proof of cause. Small samples and many comparisons can produce misleading patterns.")
-        elif mode == "What happens after a rise or fall?":
-            target_label = st.selectbox("Measure the response of", comparison_labels, key="event_target")
-            with st.expander("Event settings", expanded=False):
-                measurement_window = st.select_slider("Measure the main variable over", options=[1, 3, 5, 10, 20, 60], value=5, format_func=lambda n: f"{n} observation{'s' if n != 1 else ''}")
-                primary_change_label = st.selectbox("Main-variable change", ["Percentage change", "Absolute change"], index=0)
-                threshold = st.number_input("Count a rise/fall from", min_value=0.0, value=2.0, step=0.5, help="For percentage change, 2 means a rise of at least 2% or a fall of at least 2% across the selected window.")
-                response_label = st.selectbox("Measure the target response as", ["Percentage change", "Absolute change"], index=0)
-                horizons = st.multiselect("Measure the response after", [1, 2, 3, 5, 10, 20, 30, 60], default=[1, 3, 5, 20], format_func=lambda n: f"{n} observation{'s' if n != 1 else ''}")
-            if not horizons:
-                st.info("Select at least one response horizon.")
-            else:
-                summary, event_rows = event_study(
-                    primary,
-                    available[target_label],
-                    measurement_window=int(measurement_window),
-                    threshold=float(threshold),
-                    primary_mode="pct" if primary_change_label == "Percentage change" else "diff",
-                    response_mode="pct" if response_label == "Percentage change" else "diff",
-                    horizons=horizons,
-                    start_date=analysis_start,
-                    end_date=analysis_end,
+        if mode == "Relationships":
+            with st.expander("How to read this study", expanded=True):
+                st.markdown(
+                    "**Correlation** describes how two sets of changes co-move. It ranges from −1 to +1: values near −1 indicate opposite linear movement; "
+                    "near 0 indicates little linear association; near +1 indicates same-direction linear movement. This is not a probability or a causal effect. "
+                    "**Spearman correlation** uses ranks and captures monotonic rather than specifically linear association."
                 )
-                if summary.empty:
-                    st.info("No historical events matched that rise/fall threshold in the selected study period.")
+            setting_cols = st.columns(3)
+            with setting_cols[0]:
+                window = st.select_slider("Measure each change over", options=[1, 3, 5, 10, 20, 60], value=5, format_func=lambda n: f"{n} observation{'s' if n != 1 else ''}", key="pair_window_v11")
+            with setting_cols[1]:
+                transform_label = st.selectbox("Change measure", ["Percentage change", "Absolute change"], index=0, key="pair_transform_v11")
+            with setting_cols[2]:
+                rolling_options = [n for n in [5, 10, 20, 30, 60] if n >= 5]
+                rolling_window = st.selectbox("Rolling correlation window", rolling_options, index=min(2, len(rolling_options)-1), key="rolling_window_v11", help="Number of matched observations per rolling estimate; small windows are more erratic.")
+            transform = "pct" if transform_label == "Percentage change" else "diff"
+
+            if len(available) >= 2:
+                corr_matrix, count_matrix = correlation_matrix(
+                    available, int(window), transform, "pearson", analysis_start, analysis_end
+                )
+                if not corr_matrix.empty:
+                    st.markdown("**Across-variable relationship map**")
+                    st.caption("Each cell is Pearson correlation between the selected changes. Each pair uses only exact matching dates; hover a cell to see its matched count.")
+                    full_labels = list(corr_matrix.columns)
+                    short_labels = [_heatmap_tick_label(label) for label in full_labels]
+                    heat = go.Figure(data=go.Heatmap(
+                        z=corr_matrix.values,
+                        x=full_labels, y=list(corr_matrix.index),
+                        zmin=-1, zmax=1, zmid=0, colorscale="RdBu",
+                        text=np.round(corr_matrix.values, 2),
+                        texttemplate="%{text:.2f}",
+                        customdata=count_matrix.to_numpy(dtype=int),
+                        hovertemplate="<b>%{y}</b><br>Compared with: %{x}<br>Pearson r: %{z:.3f}<br>Matched observations: %{customdata}<extra></extra>",
+                        colorbar={"title": "Pearson r", "len": 0.85},
+                    ))
+                    heat.update_layout(
+                        height=max(430, 82 * len(corr_matrix)),
+                        margin={"l": 170, "r": 70, "t": 45, "b": 135},
+                        paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                        font={"color": "#D9E2F0", "size": 11},
+                    )
+                    heat.update_xaxes(tickmode="array", tickvals=full_labels, ticktext=short_labels, tickangle=0, tickfont={"size": 10}, automargin=True)
+                    heat.update_yaxes(tickmode="array", tickvals=list(corr_matrix.index), ticktext=short_labels, tickfont={"size": 10}, automargin=True)
+                    st.plotly_chart(heat, use_container_width=True, theme=None, config={"displaylogo": False})
+                st.caption("A correlation magnitude has no universal 'good/bad' cutoff. Large values can be unstable, driven by a few outliers, or fail to persist in another period. Correlation here is descriptive; autocorrelation and overlapping windows can make conventional independent-observation intervals optimistic.")
+
+            if len(available) >= 2:
+                pair_select_cols = st.columns(2)
+                with pair_select_cols[0]:
+                    pair_x_label = st.selectbox("First variable (X-axis)", list(available), index=list(available).index(primary_label), key="pair_x_label_v11")
+                pair_y_options = [label for label in available if label != pair_x_label]
+                with pair_select_cols[1]:
+                    default_y = pair_y_options[0]
+                    pair_y_label = st.selectbox("Second variable (Y-axis)", pair_y_options, index=0, key="pair_y_label_v11")
+                result = pair_statistics(available[pair_x_label], available[pair_y_label], int(window), transform, analysis_start, analysis_end)
+                paired = paired_change_data(available[pair_x_label], available[pair_y_label], int(window), transform, analysis_start, analysis_end)
+                mcols = st.columns(4)
+                mcols[0].metric("Matched observations", str(result["observations"]))
+                mcols[1].metric("Pearson r", _format_value(result["pearson"]))
+                mcols[2].metric("Spearman ρ", _format_value(result["spearman"]))
+                ci_text = "Unavailable"
+                if result.get("pearson_ci_low") is not None and result.get("pearson_ci_high") is not None:
+                    ci_text = f"{result['pearson_ci_low']:.2f} to {result['pearson_ci_high']:.2f}"
+                mcols[3].metric("Approx. 95% interval for r", ci_text)
+                if len(paired) >= 2:
+                    x, y = paired["primary_change"], paired["comparison_change"]
+                    scatter = go.Figure()
+                    scatter.add_trace(go.Scatter(
+                        x=x, y=y, mode="markers", name="Matched observations",
+                        marker={"size": 6, "opacity": 0.65, "color": "#38BDF8"},
+                        customdata=paired["date"].astype(str),
+                        hovertemplate=f"Date: %{{customdata}}<br>{pair_x_label}: %{{x:,.5g}}<br>{pair_y_label}: %{{y:,.5g}}<extra></extra>",
+                    ))
+                    if np.std(x) > 0:
+                        slope = result.get("slope")
+                        intercept = float(np.mean(y) - slope * np.mean(x)) if slope is not None else None
+                        if slope is not None and intercept is not None:
+                            xline = np.linspace(float(np.min(x)), float(np.max(x)), 80)
+                            scatter.add_trace(go.Scatter(x=xline, y=intercept + slope * xline, mode="lines", name="Linear fit", line={"color": "#F59E0B", "width": 2}))
+                    scatter.update_layout(
+                        title="Same-period changes: each point is one matched date",
+                        height=400, margin={"l": 55, "r": 20, "t": 55, "b": 60},
+                        paper_bgcolor="#0E1117", plot_bgcolor="#0E1117",
+                        font={"color": "#D9E2F0", "size": 11},
+                        xaxis_title=f"{pair_x_label} · {'percentage change (%)' if transform == 'pct' else 'absolute change'}",
+                        yaxis_title=f"{pair_y_label} · {'percentage change (%)' if transform == 'pct' else 'absolute change'}",
+                        legend={"orientation": "h", "y": 1.08},
+                    )
+                    scatter.update_xaxes(gridcolor="rgba(154, 167, 186, 0.16)", zeroline=True)
+                    scatter.update_yaxes(gridcolor="rgba(154, 167, 186, 0.16)", zeroline=True)
+                    st.plotly_chart(scatter, use_container_width=True, theme=None, config={"displaylogo": False})
+
+                    if result["pearson"] is not None:
+                        magnitude = abs(float(result["pearson"]))
+                        if magnitude < 0.20:
+                            magnitude_text = "very weak linear association by a rough magnitude convention"
+                        elif magnitude < 0.40:
+                            magnitude_text = "weak-to-modest linear association by a rough magnitude convention"
+                        elif magnitude < 0.60:
+                            magnitude_text = "moderate linear association by a rough magnitude convention"
+                        elif magnitude < 0.80:
+                            magnitude_text = "strong linear association by a rough magnitude convention"
+                        else:
+                            magnitude_text = "very strong linear association by a rough magnitude convention"
+                        sign_text = "positive" if result["pearson"] > 0 else "negative" if result["pearson"] < 0 else "zero"
+                        st.markdown(f"**Descriptive reading:** the observed Pearson association is {sign_text} and {magnitude_text}. These magnitude labels are only rules of thumb; they are not a universal pass/fail threshold and do not say whether the relationship is economically useful.")
+                    if result["pearson"] is None:
+                        st.info("Pearson correlation is unavailable because one series has no variation or too few matched values.")
+                    elif result["observations"] < 30:
+                        st.warning(f"Only {result['observations']} matched observations: treat the estimated relationship as tentative.")
+                    elif result.get("pearson_ci_low") is not None and result["pearson_ci_low"] <= 0 <= result["pearson_ci_high"]:
+                        st.info("The approximate interval for Pearson correlation includes zero under a simplified independent-observation assumption. This does not prove the relationship is absent.")
+                    elif result.get("pearson_ci_low") is not None:
+                        st.info("The approximate interval does not include zero under a simplified independent-observation assumption. This is still exploratory; serial dependence, outliers and selection across many variable pairs can overstate certainty.")
+                    st.caption("The shaded/approximate 95% interval uses Fisher's transformation and assumes independent paired observations. Daily returns may be autocorrelated, and overlapping multi-observation changes are dependent; use the interval as a rough guide, not a final significance test.")
+
+                    rolling = rolling_pair_correlation(
+                        available[pair_x_label], available[pair_y_label], int(window), transform,
+                        int(rolling_window), analysis_start, analysis_end,
+                    )
+                    rolling = rolling.dropna(subset=["rolling_correlation"])
+                    if not rolling.empty:
+                        roll_fig = go.Figure()
+                        ci_low = pd.to_numeric(rolling["rolling_ci_low"], errors="coerce")
+                        ci_high = pd.to_numeric(rolling["rolling_ci_high"], errors="coerce")
+                        roll_fig.add_trace(go.Scatter(
+                            x=rolling["date"], y=ci_low, mode="lines", line={"width": 0},
+                            showlegend=False, hoverinfo="skip", name="Approx. 95% lower bound",
+                        ))
+                        roll_fig.add_trace(go.Scatter(
+                            x=rolling["date"], y=ci_high, mode="lines", line={"width": 0},
+                            fill="tonexty", fillcolor="rgba(167, 139, 250, 0.16)",
+                            showlegend=True, name="Approx. 95% pointwise interval", hoverinfo="skip",
+                        ))
+                        roll_fig.add_trace(go.Scatter(
+                            x=rolling["date"], y=rolling["rolling_correlation"], mode="lines",
+                            name="Rolling Pearson r", line={"color": "#A78BFA", "width": 2},
+                            customdata=np.column_stack([ci_low, ci_high, rolling["rolling_observations"]]),
+                            hovertemplate="Date: %{x|%Y-%m-%d}<br>Rolling r: %{y:.3f}<br>Approx. interval: %{customdata[0]:.3f} to %{customdata[1]:.3f}<br>Pairs in window: %{customdata[2]}<extra></extra>",
+                        ))
+                        roll_fig.add_hline(y=0, line_dash="dash", line_color="#94A3B8")
+                        roll_fig.update_layout(title=f"Relationship stability · {rolling_window}-observation rolling correlation", height=350, margin={"l": 55, "r": 20, "t": 55, "b": 45}, paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", font={"color": "#D9E2F0", "size": 11}, yaxis={"range": [-1, 1], "title": "Pearson r"}, xaxis_title="Date", legend={"orientation": "h", "y": 1.12})
+                        roll_fig.update_xaxes(gridcolor="rgba(154, 167, 186, 0.16)")
+                        roll_fig.update_yaxes(gridcolor="rgba(154, 167, 186, 0.16)")
+                        st.plotly_chart(roll_fig, use_container_width=True, theme=None, config={"displaylogo": False})
+                        st.caption("The shaded band is an approximate 95% interval for each window, based on a Fisher transformation and an independence assumption. Windows overlap, so the band is not a simultaneous confidence band and may be too narrow when changes are serially dependent. Sign flips can reflect genuine instability or sampling noise.")
+                    else:
+                        st.info("Not enough matched observations to draw the selected rolling-correlation window.")
                 else:
-                    st.dataframe(summary, use_container_width=True, hide_index=True)
-                    with st.expander("Show individual historical events"):
-                        st.dataframe(event_rows, use_container_width=True, hide_index=True)
-                st.caption("Responses are shown only where subsequent observations exist. Horizons count observations in the target series. Overlapping events can make results dependent; the estimates are descriptive, not causal proof.")
+                    st.info("There are not enough exact matched dates to draw the relationship plot.")
+            else:
+                st.info("Add at least one comparison series to inspect a pairwise relationship.")
+
+        elif mode == "Response after events":
+            if not comparison_labels:
+                st.info("Add a target series such as an index or company to measure its response after a primary-variable event.")
+            else:
+                st.markdown("**Question:** after a defined increase or decrease in the main variable, did the target's later behaviour differ from its ordinary non-event response?")
+                target_label = st.selectbox("Target whose response is measured", comparison_labels, key="event_target_v11")
+                ecols = st.columns(4)
+                with ecols[0]:
+                    measurement_window = st.select_slider("Measure main-variable change over", options=[1, 3, 5, 10, 20, 60], value=5, format_func=lambda n: f"{n} observations", key="event_measurement_window_v11")
+                with ecols[1]:
+                    primary_change_label = st.selectbox("Primary-variable change", ["Percentage change", "Absolute change"], index=0, key="event_primary_mode_v11")
+                with ecols[2]:
+                    threshold = st.number_input("Event threshold", min_value=0.0, value=2.0, step=0.5, key="event_threshold_v11", help="For percentage change, 2 means at least +2% or at most −2% over the selected measurement window.")
+                with ecols[3]:
+                    response_label = st.selectbox("Target response units", ["Percentage change", "Absolute change"], index=0, key="event_response_mode_v11")
+                horizons = st.multiselect("Measure response after", [1, 2, 3, 5, 10, 20, 30, 60], default=[1, 3, 5, 20], format_func=lambda n: f"{n} target observations", key="event_horizons_v11")
+                if not horizons:
+                    st.info("Select at least one response horizon.")
+                else:
+                    summary, event_rows = event_study(
+                        primary, available[target_label], int(measurement_window), float(threshold),
+                        "pct" if primary_change_label == "Percentage change" else "diff",
+                        "pct" if response_label == "Percentage change" else "diff",
+                        horizons, analysis_start, analysis_end,
+                    )
+                    if summary.empty or not (summary["events_detected"] > 0).any():
+                        st.info("No historical events met this threshold with matching target observations. Lower the threshold or widen the study period if appropriate.")
+                    else:
+                        st.markdown("**Subsequent target responses versus non-event baseline**")
+                        rows_display = summary[["horizon_observations", "primary_direction", "events_detected", "realized_responses", "mean_response", "median_response", "positive_response_pct", "block_bootstrap_event_ci_low", "block_bootstrap_event_ci_high", "baseline_observations", "baseline_mean", "block_bootstrap_baseline_ci_low", "block_bootstrap_baseline_ci_high", "mean_difference_vs_baseline", "block_bootstrap_difference_ci_low", "block_bootstrap_difference_ci_high", "bootstrap_valid_replicates", "bootstrap_block_length"]].rename(columns={
+                            "horizon_observations": "Target observations ahead", "primary_direction": "Primary event", "events_detected": "Events found", "realized_responses": "Event responses available", "mean_response": "Event mean response", "median_response": "Event median response", "positive_response_pct": "Event responses positive (%)", "block_bootstrap_event_ci_low": "Event mean CI low", "block_bootstrap_event_ci_high": "Event mean CI high", "baseline_observations": "Baseline responses available", "baseline_mean": "Non-event baseline mean", "block_bootstrap_baseline_ci_low": "Baseline mean CI low", "block_bootstrap_baseline_ci_high": "Baseline mean CI high", "mean_difference_vs_baseline": "Event minus baseline", "block_bootstrap_difference_ci_low": "Difference CI low", "block_bootstrap_difference_ci_high": "Difference CI high", "bootstrap_valid_replicates": "Valid bootstrap samples", "bootstrap_block_length": "Bootstrap block length",
+                        })
+                        st.dataframe(rows_display, use_container_width=True, hide_index=True)
+                        response_fig = go.Figure()
+                        increase = summary[summary["primary_direction"] == "Increase"].sort_values("horizon_observations")
+                        decrease = summary[summary["primary_direction"] == "Decrease"].sort_values("horizon_observations")
+                        baseline = summary.drop_duplicates("horizon_observations").sort_values("horizon_observations")
+                        for group, name, color in ((increase, "After primary increase", "#F59E0B"), (decrease, "After primary decrease", "#38BDF8")):
+                            if not group.empty:
+                                y = pd.to_numeric(group["mean_response"], errors="coerce")
+                                low = pd.to_numeric(group["approx_mean_ci_low"], errors="coerce")
+                                high = pd.to_numeric(group["approx_mean_ci_high"], errors="coerce")
+                                response_fig.add_trace(go.Scatter(
+                                    x=group["horizon_observations"], y=y, mode="lines+markers", name=name,
+                                    line={"color": color, "width": 2}, marker={"size": 7},
+                                    error_y={"type": "data", "symmetric": False, "array": (high-y).clip(lower=0).fillna(0), "arrayminus": (y-low).clip(lower=0).fillna(0), "visible": True},
+                                    hovertemplate="Horizon: %{x} observations<br>Mean target response: %{y:.4g}<extra></extra>",
+                                ))
+                        if not baseline.empty:
+                            base_y = pd.to_numeric(baseline["baseline_mean"], errors="coerce")
+                            base_low = pd.to_numeric(baseline["block_bootstrap_baseline_ci_low"], errors="coerce")
+                            base_high = pd.to_numeric(baseline["block_bootstrap_baseline_ci_high"], errors="coerce")
+                            response_fig.add_trace(go.Scatter(
+                                x=baseline["horizon_observations"], y=base_y, mode="lines+markers", name="Non-event baseline mean",
+                                line={"color": "#A78BFA", "width": 2, "dash": "dash"}, marker={"size": 6},
+                                error_y={"type": "data", "symmetric": False, "array": (base_high-base_y).clip(lower=0).fillna(0), "arrayminus": (base_y-base_low).clip(lower=0).fillna(0), "visible": True},
+                                hovertemplate="Horizon: %{x} observations<br>Baseline mean: %{y:.4g}<extra></extra>",
+                            ))
+                        response_fig.add_hline(y=0, line_dash="dot", line_color="#94A3B8")
+                        response_fig.update_layout(
+                            title="Mean target response by horizon (event groups vs baseline)",
+                            xaxis_title="Target observations after event", yaxis_title="Target response" + (" (%)" if response_label == "Percentage change" else " (absolute units)"),
+                            height=430, margin={"l": 55, "r": 20, "t": 55, "b": 50},
+                            paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", font={"color": "#D9E2F0", "size": 11},
+                            legend={"orientation": "h", "y": 1.1},
+                        )
+                        response_fig.update_xaxes(gridcolor="rgba(154, 167, 186, 0.16)")
+                        response_fig.update_yaxes(gridcolor="rgba(154, 167, 186, 0.16)")
+                        st.plotly_chart(response_fig, use_container_width=True, theme=None, config={"displaylogo": False})
+                        st.markdown("**How much did the event response differ from ordinary behaviour?**")
+                        diff_fig = go.Figure()
+                        for direction_name, color in (("Increase", "#F59E0B"), ("Decrease", "#38BDF8")):
+                            group = summary[summary["primary_direction"] == direction_name].sort_values("horizon_observations")
+                            if group.empty:
+                                continue
+                            ydiff = pd.to_numeric(group["mean_difference_vs_baseline"], errors="coerce")
+                            diff_low = pd.to_numeric(group["block_bootstrap_difference_ci_low"], errors="coerce")
+                            diff_high = pd.to_numeric(group["block_bootstrap_difference_ci_high"], errors="coerce")
+                            diff_fig.add_trace(go.Scatter(
+                                x=group["horizon_observations"], y=ydiff, mode="lines+markers", name=f"After primary {direction_name.lower()}",
+                                line={"color": color, "width": 2}, marker={"size": 7},
+                                error_y={"type": "data", "symmetric": False, "array": (diff_high-ydiff).clip(lower=0).fillna(0), "arrayminus": (ydiff-diff_low).clip(lower=0).fillna(0), "visible": True},
+                                customdata=np.column_stack([group["events_detected"], group["realized_responses"], group["bootstrap_valid_replicates"]]),
+                                hovertemplate="Horizon: %{x} target observations<br>Event mean − baseline mean: %{y:.4g}<br>Events: %{customdata[0]}<br>Realised event responses: %{customdata[1]}<br>Valid block-bootstrap samples: %{customdata[2]}<extra></extra>",
+                            ))
+                        diff_fig.add_hline(y=0, line_dash="dash", line_color="#F8FAFC")
+                        diff_fig.update_layout(
+                            title="Event response minus non-event baseline",
+                            xaxis_title="Target observations after event",
+                            yaxis_title="Difference in mean target response" + (" (percentage points)" if response_label == "Percentage change" else " (target units)"),
+                            height=370, margin={"l": 55, "r": 20, "t": 55, "b": 45},
+                            paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", font={"color": "#D9E2F0", "size": 11},
+                            legend={"orientation": "h", "y": 1.1},
+                        )
+                        diff_fig.update_xaxes(gridcolor="rgba(154, 167, 186, 0.16)")
+                        diff_fig.update_yaxes(gridcolor="rgba(154, 167, 186, 0.16)")
+                        st.plotly_chart(diff_fig, use_container_width=True, theme=None, config={"displaylogo": False})
+
+                        interpret_cols = st.columns(2)
+                        with interpret_cols[0]:
+                            interpret_horizon = st.selectbox("Explain this horizon", sorted(summary["horizon_observations"].unique().tolist()), key="event_interpret_horizon_v13", format_func=lambda n: f"{n} target observations")
+                        with interpret_cols[1]:
+                            interpret_direction = st.selectbox("After which event?", ["Increase", "Decrease"], key="event_interpret_direction_v13")
+                        chosen_rows = summary[(summary["horizon_observations"] == interpret_horizon) & (summary["primary_direction"] == interpret_direction)]
+                        if not chosen_rows.empty:
+                            chosen = chosen_rows.iloc[0]
+                            difference = chosen["mean_difference_vs_baseline"]
+                            unit_text = "percentage points" if response_label == "Percentage change" else "target units"
+                            diff_low = chosen["block_bootstrap_difference_ci_low"]
+                            diff_high = chosen["block_bootstrap_difference_ci_high"]
+                            base_n = int(chosen["baseline_observations"])
+                            event_n = int(chosen["realized_responses"])
+                            st.markdown(
+                                f"**Observed:** {event_n} realised event responses from {int(chosen['events_detected'])} detected events; "
+                                f"the matched non-event baseline has {base_n} realised responses. The event mean was "
+                                f"{_format_value(chosen['mean_response'])}, versus baseline {_format_value(chosen['baseline_mean'])}. "
+                                f"Difference: {_format_value(difference)} {unit_text}."
+                            )
+                            if diff_low is None or diff_high is None or pd.isna(diff_low) or pd.isna(diff_high):
+                                st.warning("A dependence-aware interval could not be estimated from this sample. The graph's difference is descriptive only.")
+                            elif diff_low <= 0 <= diff_high:
+                                st.info(f"The approximate 95% moving-block-bootstrap interval for the difference is {_format_value(diff_low)} to {_format_value(diff_high)} {unit_text}; it includes zero. This sample does not clearly distinguish the event response from the baseline. The interval is exploratory and not adjusted for trying multiple horizons/thresholds.")
+                            else:
+                                direction_text = "above" if diff_low > 0 else "below"
+                                st.info(f"The approximate 95% moving-block-bootstrap interval for the difference is {_format_value(diff_low)} to {_format_value(diff_high)} {unit_text}; it lies {direction_text} zero in this sample. This is a candidate association, not proof of causation, and is not adjusted for trying multiple horizons/thresholds.")
+                            if event_n < 20:
+                                st.warning("Fewer than 20 realised event responses: this event estimate may be unstable. This is a practical caution, not a universal validity cutoff.")
+                        with st.expander("Show individual historical events and their realised responses"):
+                            st.dataframe(event_rows, use_container_width=True, hide_index=True)
+                        st.caption("The dashed baseline is the mean target response on matched dates when the primary-variable threshold was not crossed. Error bars on the difference graph are 95% circular moving-block-bootstrap intervals that preserve contiguous matched-date blocks, approximately accounting for local dependence and overlapping horizons. They remain exploratory; threshold/horizon selection and multiple testing are not corrected.")
+
         else:
-            compared = st.selectbox("Check timing against", comparison_labels, key="lag_target")
-            with st.expander("Timing settings", expanded=False):
-                window = st.select_slider("Measure change over", options=[1, 3, 5, 10, 20, 60], value=5, format_func=lambda n: f"{n} observation{'s' if n != 1 else ''}")
-                transform_label = st.selectbox("Measure changes as", ["Percentage change", "Absolute change"], index=0)
-                max_lag = st.select_slider("Check up to", options=[1, 3, 5, 10, 20], value=5, format_func=lambda n: f"±{n} observations")
-            result = lead_lag_statistics(
-                primary, available[compared], int(window),
-                "pct" if transform_label == "Percentage change" else "diff",
-                int(max_lag), analysis_start, analysis_end,
-            )
-            st.dataframe(result.rename(columns={"lag_observations": "Compared-series timing (observations)", "correlation": "Correlation", "observations": "Matched observations"}), use_container_width=True, hide_index=True)
-            st.caption("Negative timing means the comparison series tends to move earlier in the tested alignment; positive timing means later. This is exploratory and not proof that one variable causes the other.")
+            if not comparison_labels:
+                st.info("Add a comparison series to test lead/lag timing.")
+            else:
+                compared = st.selectbox("Compare timing with", comparison_labels, key="lag_target_v11")
+                lcols = st.columns(3)
+                with lcols[0]:
+                    window = st.select_slider("Measure changes over", options=[1, 3, 5, 10, 20, 60], value=5, format_func=lambda n: f"{n} observations", key="lag_window_v11")
+                with lcols[1]:
+                    transform_label = st.selectbox("Change measure", ["Percentage change", "Absolute change"], index=0, key="lag_transform_v11")
+                with lcols[2]:
+                    max_lag = st.select_slider("Check timing up to", options=[1, 3, 5, 10, 20], value=5, format_func=lambda n: f"±{n} observations", key="lag_max_v11")
+                result = lead_lag_statistics(
+                    primary, available[compared], int(window),
+                    "pct" if transform_label == "Percentage change" else "diff",
+                    int(max_lag), analysis_start, analysis_end,
+                )
+                lag_fig = go.Figure()
+                lag_low = pd.to_numeric(result["ci_low"], errors="coerce")
+                lag_high = pd.to_numeric(result["ci_high"], errors="coerce")
+                lag_fig.add_trace(go.Scatter(x=result["lag_observations"], y=lag_low, mode="lines", line={"width": 0}, showlegend=False, hoverinfo="skip", name="Approx. 95% lower bound"))
+                lag_fig.add_trace(go.Scatter(x=result["lag_observations"], y=lag_high, mode="lines", line={"width": 0}, fill="tonexty", fillcolor="rgba(56, 189, 248, 0.15)", showlegend=True, name="Approx. 95% pointwise interval", hoverinfo="skip"))
+                lag_fig.add_trace(go.Scatter(
+                    x=result["lag_observations"], y=result["correlation"], mode="lines+markers",
+                    line={"color": "#38BDF8", "width": 2}, marker={"size": 7}, name="Correlation by lag",
+                    customdata=np.column_stack([result["observations"], lag_low, lag_high]),
+                    hovertemplate="Lag: %{x} matched observations<br>Correlation: %{y:.3f}<br>Approx. interval: %{customdata[1]:.3f} to %{customdata[2]:.3f}<br>Matched pairs: %{customdata[0]}<extra></extra>",
+                ))
+                lag_fig.add_vline(x=0, line_dash="dash", line_color="#F59E0B")
+                lag_fig.add_hline(y=0, line_dash="dot", line_color="#94A3B8")
+                valid_corr = pd.to_numeric(result["correlation"], errors="coerce").dropna()
+                valid_bounds = pd.concat([lag_low, lag_high, valid_corr], ignore_index=True).dropna()
+                full_lag_scale = st.checkbox("Use full correlation scale (−1 to +1)", value=False, key="lag_full_scale_v13")
+                if full_lag_scale or valid_bounds.empty:
+                    y_range = [-1, 1]
+                else:
+                    low_edge, high_edge = float(valid_bounds.min()), float(valid_bounds.max())
+                    pad = max((high_edge - low_edge) * 0.20, 0.03)
+                    y_range = [max(-1, low_edge - pad), min(1, high_edge + pad)]
+                lag_fig.update_layout(
+                    title="Correlation at different time alignments",
+                    xaxis_title="Comparison series timing relative to main variable (observations; negative = earlier)",
+                    yaxis_title="Pearson correlation", yaxis={"range": y_range}, height=410,
+                    margin={"l": 55, "r": 20, "t": 65, "b": 75},
+                    paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", font={"color": "#D9E2F0", "size": 11},
+                    legend={"orientation": "h", "y": 1.12},
+                )
+                lag_fig.update_xaxes(gridcolor="rgba(154, 167, 186, 0.16)")
+                lag_fig.update_yaxes(gridcolor="rgba(154, 167, 186, 0.16)")
+                st.plotly_chart(lag_fig, use_container_width=True, theme=None, config={"displaylogo": False})
+                usable = result.dropna(subset=["correlation"])
+                if not usable.empty:
+                    peak = usable.loc[usable["correlation"].abs().idxmax()]
+                    lag = int(peak["lag_observations"])
+                    direction = "earlier" if lag < 0 else "later" if lag > 0 else "at the same matched observation"
+                    peak_value = float(peak["correlation"])
+                    ci_low = peak.get("ci_low")
+                    ci_high = peak.get("ci_high")
+                    if ci_low is None or ci_high is None or pd.isna(ci_low) or pd.isna(ci_high):
+                        st.info(f"The largest absolute correlation was {_format_value(peak_value)} at lag {lag} ({direction}), based on {int(peak['observations'])} matched pairs. Its interval is unavailable, so treat it as a descriptive peak only.")
+                    elif float(ci_low) <= 0 <= float(ci_high):
+                        st.info(f"The largest absolute observed correlation was {_format_value(peak_value)} at lag {lag} ({direction}), based on {int(peak['observations'])} pairs. Its approximate interval ({float(ci_low):.3f} to {float(ci_high):.3f}) includes zero, so the sample does not clearly distinguish this peak from zero. This is the maximum selected from {len(usable)} lags and may be inflated by searching.")
+                    else:
+                        st.warning(f"The peak correlation was {_format_value(peak_value)} at lag {lag} ({direction}), and its approximate pointwise interval ({float(ci_low):.3f} to {float(ci_high):.3f}) excludes zero under an independent-pair assumption. Because this was selected as the strongest of {len(usable)} tested lags, it is a candidate for further testing, not confirmatory evidence.")
+                    if abs(peak_value) < 0.10:
+                        st.caption("The strongest correlation is numerically close to zero in this run; no pronounced lead/lag pattern stands out. This is a descriptive observation, not a universal cutoff.")
+                st.caption("The shaded band is an approximate pointwise Fisher-transformation interval assuming independent paired changes. It is not adjusted for serial dependence or the number of lags tested. Lag counts matched observations, not automatically calendar days. The default y-axis zooms into the observed range for readability; use the full-scale checkbox to restore −1 to +1.")
 
     with data_tab:
         chosen = st.selectbox("Show observations for", list(available), key="raw_series_selection")

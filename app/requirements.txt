@@ -1,5 +1,5 @@
 streamlit
-plotly
+plotly==6.5.2
 pandas
 numpy
 duckdb
