@@ -25,6 +25,7 @@ from .derivative_filters import (
 
 
 SOURCE_MARKET = "Market asset / company price"
+SOURCE_COMMODITY_PRICES = "MCX commodity market prices (OHLC)"
 SOURCE_MACRO = "Macro / global indicator"
 SOURCE_MATRIX = "Derivatives & microstructure matrix"
 SOURCE_OPTIONS = "Stock/index options contracts"
@@ -43,6 +44,7 @@ SOURCE_Y_INDIRECT = "Yearly indirect cash flow"
 
 SOURCES = [
     SOURCE_MARKET,
+    SOURCE_COMMODITY_PRICES,
     SOURCE_MACRO,
     SOURCE_MATRIX,
     SOURCE_OPTIONS,
@@ -137,6 +139,7 @@ BASIS_METRICS = [
 RAW_DERIVATIVE_FILTERS = {
     SOURCE_OPTIONS: STOCK_INDEX_OPTIONS_SQL,
     SOURCE_COMMODITY_OPTIONS: COMMODITY_OPTIONS_SQL,
+    SOURCE_COMMODITY_PRICES: COMMODITY_FUTURES_SQL,
     SOURCE_FUTURES: STOCK_INDEX_FUTURES_SQL,
     SOURCE_COMMODITY_FUTURES: COMMODITY_FUTURES_SQL,
 }
@@ -228,7 +231,7 @@ FINANCIAL_METRICS: dict[str, list[Metric]] = {
 
 
 def metric_options(source: str) -> list[Metric]:
-    if source in (SOURCE_MARKET, SOURCE_MACRO):
+    if source in (SOURCE_MARKET, SOURCE_MACRO, SOURCE_COMMODITY_PRICES):
         return PRICE_METRICS
     if source == SOURCE_MATRIX:
         return MATRIX_METRICS

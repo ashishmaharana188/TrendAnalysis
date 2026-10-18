@@ -16,6 +16,7 @@ from app.services.statistics_service import (
     pair_statistics,
     paired_change_data,
     rolling_pair_correlation,
+    relationship_diagnostic,
     variable_summary,
 )
 
@@ -214,6 +215,56 @@ class StatisticsServiceTests(unittest.TestCase):
         self.assertTrue((summary["baseline_observations"] >= 0).all())
         self.assertIn("response", events.columns)
 
+
+    def test_log_returns_and_zscores_are_unit_agnostic(self):
+        a = series([100, 110, 99, 108.9, 119.79, 107.811])
+        b = series([2000, 2200, 1980, 2178, 2395.8, 2156.22])
+        log_a = change_series(a, window=1, mode="log")
+        log_b = change_series(b, window=1, mode="log")
+        self.assertAlmostEqual(log_a["change"].iloc[1], log_b["change"].iloc[1], places=8)
+        z_a = change_series(a, window=1, mode="zlog", standardize_start_date="2025-01-02", standardize_end_date="2025-01-06")
+        z_b = change_series(b, window=1, mode="zlog", standardize_start_date="2025-01-02", standardize_end_date="2025-01-06")
+        self.assertAlmostEqual(float(z_a["change"].mean()), 0.0, places=8)
+        self.assertAlmostEqual(float(z_b["change"].mean()), 0.0, places=8)
+
+    def test_pair_changes_are_calculated_after_timestamp_intersection(self):
+        a = pd.DataFrame({"date": pd.to_datetime(["2025-01-01", "2025-01-02", "2025-01-03", "2025-01-04"]), "value": [100, 110, 121, 133.1]})
+        b = pd.DataFrame({"date": pd.to_datetime(["2025-01-01", "2025-01-03", "2025-01-04"]), "value": [20, 22, 24.2]})
+        paired = paired_change_data(a, b, window=1, mode="pct")
+        self.assertEqual(paired["date"].dt.strftime("%Y-%m-%d").tolist(), ["2025-01-03", "2025-01-04"])
+        self.assertAlmostEqual(float(paired["primary_change"].iloc[0]), 21.0)
+        self.assertAlmostEqual(float(paired["comparison_change"].iloc[0]), 10.0)
+
+    def test_end_date_is_inclusive_for_intraday_rows(self):
+        frame = pd.DataFrame({
+            "date": pd.to_datetime(["2025-01-04 09:15", "2025-01-04 15:25", "2025-01-05 09:15", "2025-01-05 15:25"]),
+            "value": [100, 101, 102, 103],
+        })
+        companion = frame.assign(value=[200, 202, 204, 206])
+        paired = paired_change_data(frame, companion, window=1, mode="pct", start_date="2025-01-04", end_date="2025-01-04")
+        self.assertEqual(paired["date"].dt.strftime("%Y-%m-%d %H:%M").tolist(), ["2025-01-04 15:25"])
+
+    def test_relationship_diagnostic_requires_effect_significance_and_sample_support(self):
+        supported = {
+            "observations": 240, "effective_observations": 120.0, "pearson": 0.55,
+            "pearson_ci_low": 0.39, "pearson_ci_high": 0.68, "approx_p_value": 0.0001,
+        }
+        diagnostic = relationship_diagnostic(supported, family_size=10)
+        self.assertEqual(diagnostic["status"], "GREEN")
+        self.assertEqual(diagnostic["strength"], "Large")
+        underpowered = dict(supported, observations=40)
+        self.assertEqual(relationship_diagnostic(underpowered)["status"], "GREY")
+        weak = dict(supported, pearson=0.18, pearson_ci_low=0.05, pearson_ci_high=0.30, approx_p_value=0.001)
+        self.assertEqual(relationship_diagnostic(weak)["status"], "RED")
+        non_significant = dict(supported, pearson_ci_low=-0.05, pearson_ci_high=0.75, approx_p_value=0.08)
+        self.assertEqual(relationship_diagnostic(non_significant)["status"], "RED")
+
+    def test_lead_lag_includes_approximate_elapsed_time(self):
+        a = series([100, 101, 103, 102, 105, 107, 106, 109, 110, 112, 111, 114, 116, 115, 118])
+        b = series([50, 50.5, 51.5, 51, 52.5, 53.5, 53, 54.5, 55, 56, 55.5, 57, 58, 57.5, 59])
+        result = lead_lag_statistics(a, b, window=1, max_lag=2)
+        self.assertIn("lag_minutes_approx", result.columns)
+        self.assertEqual(float(result.loc[result["lag_observations"] == 1, "lag_minutes_approx"].iloc[0]), 1440.0)
 
 
 if __name__ == "__main__":

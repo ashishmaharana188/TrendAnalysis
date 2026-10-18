@@ -12,7 +12,7 @@ from data_access.macro_global import get_macro_history
 from data_access.query import execute_arrow
 
 from .catalog import (
-    SOURCE_BASIS, SOURCE_COMMODITY_FUTURES, SOURCE_COMMODITY_OPTIONS,
+    SOURCE_BASIS, SOURCE_COMMODITY_FUTURES, SOURCE_COMMODITY_OPTIONS, SOURCE_COMMODITY_PRICES,
     SOURCE_FUTURES, SOURCE_INSTITUTIONAL, SOURCE_MACRO, SOURCE_MARKET,
     SOURCE_MATRIX, SOURCE_OPTIONS, RAW_DERIVATIVE_FILTERS, FINANCIAL_METRICS,
     SeriesRequest, get_financial_loader,
@@ -140,7 +140,7 @@ def load_series(
         contracts = _load_raw_derivative_contracts(source, identifier, start_date, end_date)
         frame = aggregate_option_contracts(contracts)
         result = _series_frame(frame, "report_date", metric, request.label)
-    elif source in (SOURCE_FUTURES, SOURCE_COMMODITY_FUTURES):
+    elif source in (SOURCE_FUTURES, SOURCE_COMMODITY_FUTURES, SOURCE_COMMODITY_PRICES):
         contracts = _load_raw_derivative_contracts(source, identifier, start_date, end_date)
         frame = select_representative_futures_contract(contracts)
         frame = add_futures_basis_columns(frame)
@@ -190,6 +190,10 @@ def load_series(
 
 def series_construction_note(request: SeriesRequest) -> str:
     """Explain in plain language how a plotted series is constructed."""
+    if request.source == SOURCE_COMMODITY_PRICES:
+        return ("MCX commodity market prices are loaded from raw unified_market_master FUTCOM rows. "
+                "The chart uses the daily OHLCV fields from the highest-open-interest contract for the selected ticker on each date; "
+                "the selected expiry can change over time, so inspect rollover dates before comparing price gaps.")
     if request.source == SOURCE_MARKET:
         return ("Market prices are loaded from the freshest available ticker alias "
                 "(canonical ticker or .NS variant). Check the data-coverage panel for the actual last observation.")

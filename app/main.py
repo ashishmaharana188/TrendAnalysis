@@ -21,6 +21,7 @@ from app.services.catalog import (
     SOURCE_BASIS,
     SOURCE_COMMODITY_FUTURES,
     SOURCE_COMMODITY_OPTIONS,
+    SOURCE_COMMODITY_PRICES,
     SOURCE_FUTURES,
     SOURCE_INSTITUTIONAL,
     SOURCE_MACRO,
@@ -35,6 +36,7 @@ from app.services.catalog import (
 from app.services.series_service import load_series, series_construction_note
 from app.services.derivative_helpers import find_exact_underlying_match, normalize_underlying_symbol
 from app.services.statistics_service import (
+    STATISTICAL_CHANGE_MODES,
     correlation_matrix,
     distribution_frame,
     distribution_interpretation,
@@ -43,6 +45,8 @@ from app.services.statistics_service import (
     lead_lag_statistics,
     pair_statistics,
     paired_change_data,
+    relationship_diagnostic,
+    normalize_series,
     rolling_pair_correlation,
     variable_summary,
 )
@@ -54,7 +58,7 @@ st.set_page_config(page_title="TrendAnalysis", page_icon="📈", layout="wide")
 
 # Friendly categories are deliberately fewer than the underlying database tables.
 DOMAIN_SOURCES = {
-    "Market prices": [SOURCE_MARKET],
+    "Market prices": [SOURCE_MARKET, SOURCE_COMMODITY_PRICES],
     "Macro & global": [SOURCE_MACRO],
     "Trading activity": [SOURCE_MATRIX],
     "Options": [SOURCE_OPTIONS, SOURCE_COMMODITY_OPTIONS],
@@ -95,6 +99,7 @@ def default_metric(source: str, metrics) -> str:
         SOURCE_MATRIX: "close",
         SOURCE_OPTIONS: "oi_pcr",
         SOURCE_COMMODITY_OPTIONS: "oi_pcr",
+        SOURCE_COMMODITY_PRICES: "close",
         SOURCE_FUTURES: "close",
         SOURCE_COMMODITY_FUTURES: "close",
         SOURCE_BASIS: "basis_percentage",
@@ -113,6 +118,8 @@ def default_metric(source: str, metrics) -> str:
 
 
 def metric_help(source: str, metric: str) -> str:
+    if source == SOURCE_COMMODITY_PRICES:
+        return "Plots daily MCX commodity OHLCV from unified_market_master. Open, High, Low and Close are available; the OHLC readout uses the raw contract values. The represented expiry may roll when open interest changes."
     if source in (SOURCE_MARKET, SOURCE_MACRO):
         return "The default plots the series' closing/value observation. Choose another measure only when useful."
     if source == SOURCE_MATRIX:
@@ -135,6 +142,19 @@ def _format_value(value, suffix: str = "") -> str:
         return f"{float(value):,.3f}{suffix}"
     except (TypeError, ValueError):
         return "Not available"
+
+
+def _format_p_value(value) -> str:
+    """Format small probabilities without misleadingly rounding them to zero."""
+    try:
+        if value is None or pd.isna(value):
+            return "N/A"
+        p_value = float(value)
+        if p_value < 0.001:
+            return "<0.001"
+        return f"{p_value:.3f}"
+    except (TypeError, ValueError):
+        return "N/A"
 
 
 def _heatmap_tick_label(label: str) -> str:
@@ -178,6 +198,7 @@ def _friendly_series_label(request: SeriesRequest) -> str:
         SOURCE_MATRIX: "Trading activity",
         SOURCE_OPTIONS: "Options",
         SOURCE_COMMODITY_OPTIONS: "Commodity options",
+        SOURCE_COMMODITY_PRICES: "Commodity prices",
         SOURCE_FUTURES: "Futures",
         SOURCE_COMMODITY_FUTURES: "Commodity futures",
         SOURCE_BASIS: "Futures basis",
@@ -245,12 +266,13 @@ def _selected_context_request(entries: list[dict[str, str]]) -> SeriesRequest | 
 def _add_series_controls() -> None:
     entries: list[dict[str, str]] = st.session_state["workspace_series"]
     derivative_sources = {
-        SOURCE_OPTIONS, SOURCE_COMMODITY_OPTIONS,
+        SOURCE_OPTIONS, SOURCE_COMMODITY_OPTIONS, SOURCE_COMMODITY_PRICES,
         SOURCE_FUTURES, SOURCE_COMMODITY_FUTURES, SOURCE_BASIS,
     }
     derivative_source_labels = {
         SOURCE_OPTIONS: "Stock / index options",
         SOURCE_COMMODITY_OPTIONS: "Commodity options",
+        SOURCE_COMMODITY_PRICES: "MCX commodity OHLC prices",
         SOURCE_FUTURES: "Stock / index futures contracts",
         SOURCE_COMMODITY_FUTURES: "Commodity futures contracts",
         SOURCE_BASIS: "Stock / index spot-futures basis (legacy view)",
@@ -268,6 +290,17 @@ def _add_series_controls() -> None:
                     sources,
                     format_func=lambda item: FINANCIAL_SOURCE_LABELS.get(item, item),
                     key="add_financial_source",
+                )
+        elif domain == "Market prices":
+            with detail_col:
+                source = st.selectbox(
+                    "Price universe",
+                    sources,
+                    format_func=lambda item: {
+                        SOURCE_MARKET: "Equities / global market assets",
+                        SOURCE_COMMODITY_PRICES: "MCX commodities (daily OHLCV)",
+                    }.get(item, item),
+                    key="add_market_price_universe",
                 )
         elif domain in ("Futures", "Options"):
             with detail_col:
@@ -295,7 +328,7 @@ def _add_series_controls() -> None:
             catalogue_error = str(exc)
             st.warning(f"Could not load this catalogue: {exc}")
         commodity_coverage: list[dict[str, object]] = []
-        if source in (SOURCE_COMMODITY_FUTURES, SOURCE_COMMODITY_OPTIONS):
+        if source in (SOURCE_COMMODITY_FUTURES, SOURCE_COMMODITY_OPTIONS, SOURCE_COMMODITY_PRICES):
             try:
                 commodity_coverage = cached_commodity_contract_coverage()
             except Exception as exc:
@@ -312,7 +345,7 @@ def _add_series_controls() -> None:
                     })
                     st.dataframe(coverage_frame, use_container_width=True, hide_index=True)
                     st.caption(
-                        "Coverage is counted directly from unified_market_master. FUTCOM is commodity futures; "
+                        "Coverage is counted directly from unified_market_master. FUTCOM rows supply commodity futures prices; "
                         "OPTFUT / OPTCOM are treated as commodity options only when OptionType is CE or PE."
                     )
                 else:
@@ -324,6 +357,18 @@ def _add_series_controls() -> None:
         if not identifiers:
             if catalogue_error is not None:
                 st.info("The catalogue query failed. Fix the database/query error above before concluding that the data is absent.")
+            elif source == SOURCE_COMMODITY_PRICES:
+                if commodity_coverage:
+                    raw_types = sorted({str(item.get("instrument_type", "")) for item in commodity_coverage})
+                    st.warning(
+                        f"Commodity rows exist ({', '.join(raw_types)}), but no rows matched the FUTCOM futures-price filter. "
+                        "Check InstrumentType and OptionType mapping; options rows are not futures price bars."
+                    )
+                else:
+                    st.warning(
+                        "No raw commodity rows were found in unified_market_master. "
+                        "Check upstream ingestion before debugging the price chart."
+                    )
             elif source in (SOURCE_COMMODITY_FUTURES, SOURCE_COMMODITY_OPTIONS):
                 if commodity_coverage:
                     raw_types = sorted({str(item.get("instrument_type", "")) for item in commodity_coverage})
@@ -377,10 +422,10 @@ def _add_series_controls() -> None:
                         f"Selected underlying {identifier} differs from the main series identifier {context_symbol}. "
                         "This will be a manually chosen related-instrument comparison, not the same-company contract."
                     )
-            if source in (SOURCE_COMMODITY_FUTURES, SOURCE_COMMODITY_OPTIONS):
+            if source in (SOURCE_COMMODITY_FUTURES, SOURCE_COMMODITY_OPTIONS, SOURCE_COMMODITY_PRICES):
                 st.caption(
-                    "Commodity contracts are read directly from unified_market_master, not the equity-linked basis view. "
-                    "FUTCOM is used for commodity futures; OPTFUT / OPTCOM with CE or PE are used for commodity options."
+                    "Commodity data are read directly from unified_market_master, not the equity-linked basis view. "
+                    "The Market prices option uses FUTCOM daily OHLCV; commodity-option PCR remains a separate aggregated series."
                 )
             if identifier is None:
                 st.warning("Choose the underlying before adding this series. No default ticker will be substituted.")
@@ -812,15 +857,11 @@ def main() -> None:
     with analysis_tab:
         st.subheader("Statistical research")
         guide_path = Path(__file__).with_name("STATISTICAL_GUIDE.md")
-        with st.expander("Open statistical definitions and interpretation guide", expanded=False):
+        with st.expander("Statistical methods and thresholds", expanded=False):
             if guide_path.exists():
                 st.markdown(guide_path.read_text(encoding="utf-8"))
             else:
-                st.info("The full statistical guide is not present in this app folder.")
-        st.markdown(
-            "This section measures historical relationships. It does not label a coefficient as universally good or bad: "
-            "interpretation depends on effect size, matched sample, uncertainty, stability and the question being tested."
-        )
+                st.info("Statistical guide not found.")
         st.caption(f"Main variable: {primary_label} · Study dates: {analysis_start.isoformat()} to {analysis_end.isoformat()}")
         mode = st.radio(
             "Research question",
@@ -831,21 +872,17 @@ def main() -> None:
         )
         comparison_labels = [label for label in available if label != primary_label]
         if mode == "Relationships":
-            with st.expander("How to read this study", expanded=True):
-                st.markdown(
-                    "**Correlation** describes how two sets of changes co-move. It ranges from −1 to +1: values near −1 indicate opposite linear movement; "
-                    "near 0 indicates little linear association; near +1 indicates same-direction linear movement. This is not a probability or a causal effect. "
-                    "**Spearman correlation** uses ranks and captures monotonic rather than specifically linear association."
-                )
+            with st.expander("Correlation thresholds", expanded=False):
+                st.markdown("**|r|:** `<0.10` negligible · `0.10–0.29` small · `0.30–0.49` moderate · `≥0.50` large. These are conventional effect-size bands, not universal trading cutoffs.")
             setting_cols = st.columns(3)
             with setting_cols[0]:
                 window = st.select_slider("Measure each change over", options=[1, 3, 5, 10, 20, 60], value=5, format_func=lambda n: f"{n} observation{'s' if n != 1 else ''}", key="pair_window_v11")
             with setting_cols[1]:
-                transform_label = st.selectbox("Change measure", ["Percentage change", "Absolute change"], index=0, key="pair_transform_v11")
+                transform_label = st.selectbox("Common comparison scale", list(STATISTICAL_CHANGE_MODES), index=0, key="pair_transform_v18", help="Log returns compare positive price series in relative-change units; z-score modes express each series in study-period standard deviations. Absolute changes are only comparable when native units match.")
             with setting_cols[2]:
                 rolling_options = [n for n in [5, 10, 20, 30, 60] if n >= 5]
                 rolling_window = st.selectbox("Rolling correlation window", rolling_options, index=min(2, len(rolling_options)-1), key="rolling_window_v11", help="Number of matched observations per rolling estimate; small windows are more erratic.")
-            transform = "pct" if transform_label == "Percentage change" else "diff"
+            transform = STATISTICAL_CHANGE_MODES[transform_label]
 
             if len(available) >= 2:
                 corr_matrix, count_matrix = correlation_matrix(
@@ -853,7 +890,7 @@ def main() -> None:
                 )
                 if not corr_matrix.empty:
                     st.markdown("**Across-variable relationship map**")
-                    st.caption(f"Each cell is Pearson correlation between {window}-observation {'percentage changes' if transform == 'pct' else 'absolute changes'}. Each pair uses exact matching dates; hover a cell to see its matched count. Multi-observation changes overlap through time, so use this heatmap descriptively.")
+                    st.caption(f"Pairwise Pearson r · {window}-observation {transform_label.lower()} · exact matched timestamps · hover for N. |r| bands: <0.10 negligible · 0.10–0.29 small · 0.30–0.49 moderate · ≥0.50 large.")
                     full_labels = list(corr_matrix.columns)
                     short_labels = [_heatmap_tick_label(label) for label in full_labels]
                     heat = go.Figure(data=go.Heatmap(
@@ -875,7 +912,7 @@ def main() -> None:
                     heat.update_xaxes(tickmode="array", tickvals=full_labels, ticktext=short_labels, tickangle=0, tickfont={"size": 10}, automargin=True)
                     heat.update_yaxes(tickmode="array", tickvals=list(corr_matrix.index), ticktext=short_labels, tickfont={"size": 10}, automargin=True)
                     st.plotly_chart(heat, use_container_width=True, theme=None, config={"displaylogo": False})
-                st.caption("A correlation magnitude has no universal 'good/bad' cutoff. Large values can be unstable, driven by a few outliers, or fail to persist in another period. Correlation here is descriptive; autocorrelation and overlapping windows can make conventional independent-observation intervals optimistic.")
+                st.caption("The heatmap is descriptive. The selected-pair panel below applies a sample-size gate, a 95% interval, and a multiple-pair adjustment before showing GREEN.")
 
             if len(available) >= 2:
                 pair_select_cols = st.columns(2)
@@ -887,16 +924,45 @@ def main() -> None:
                     pair_y_label = st.selectbox("Second variable (Y-axis)", pair_y_options, index=0, key="pair_y_label_v11")
                 result = pair_statistics(available[pair_x_label], available[pair_y_label], int(window), transform, analysis_start, analysis_end)
                 paired = paired_change_data(available[pair_x_label], available[pair_y_label], int(window), transform, analysis_start, analysis_end)
-                mcols = st.columns(5)
-                mcols[0].metric("Matched observations", str(result["observations"]))
-                mcols[1].metric("Effective observations*", _format_value(result.get("effective_observations")))
-                mcols[2].metric("Pearson r", _format_value(result["pearson"]))
-                mcols[3].metric("Spearman ρ", _format_value(result["spearman"]))
-                ci_text = "Unavailable"
+                family_size = max(1, len(available) * (len(available) - 1) // 2)
+                diagnostic = relationship_diagnostic(result, family_size=family_size)
+                r_value = result.get("pearson")
+                r_text = _format_value(r_value)
+                ci_text = "N/A"
                 if result.get("pearson_ci_low") is not None and result.get("pearson_ci_high") is not None:
-                    ci_text = f"{result['pearson_ci_low']:.2f} to {result['pearson_ci_high']:.2f}"
-                mcols[4].metric("Approx. 95% interval for r", ci_text)
-                st.caption("*Effective observations are a Bartlett-style approximation that discounts some serial dependence. They are not an exact sample size and cannot by themselves correct for non-stationarity, outliers, overlapping changes or trying many variable pairs.")
+                    ci_text = f"[{result['pearson_ci_low']:.3f}, {result['pearson_ci_high']:.3f}]"
+                p_text = _format_p_value(diagnostic.get("adjusted_p_value"))
+                if diagnostic["status"] == "GREEN":
+                    st.success(f"GREEN · {diagnostic['strength']} relationship · |r|={abs(float(r_value)):.3f} · familywise-adjusted p={p_text}")
+                elif diagnostic["status"] == "RED":
+                    st.error(f"RED · evidence threshold not met · {diagnostic['strength']} · adjusted p={p_text}")
+                else:
+                    st.info("GREY · insufficient matched/effective observations or uncertainty estimate to classify")
+                mcols = st.columns(5)
+                mcols[0].metric("Pearson r", r_text)
+                mcols[1].metric("95% CI", ci_text)
+                mcols[2].metric("Adjusted p (approx.)", p_text)
+                mcols[3].metric("Matched N / effective N", f"{result['observations']} / {_format_value(result.get('effective_observations'))}")
+                mcols[4].metric("Spearman ρ", _format_value(result["spearman"]))
+                st.caption("GREEN requires |r| ≥ 0.30, 95% CI excluding zero, Bonferroni-adjusted p ≤ 0.05, N ≥ 60 and effective N ≥ 30. p/CI use a Fisher-z approximation with serial-dependence-adjusted effective N; results are not causal.")
+                # A shared index makes positive-valued levels visually comparable even
+                # when the raw units differ (e.g., Nifty points versus crude-oil price).
+                raw_x = normalize_series(available[pair_x_label]).rename(columns={"value": "x_level"})
+                raw_y = normalize_series(available[pair_y_label]).rename(columns={"value": "y_level"})
+                indexed = raw_x.merge(raw_y, on="date", how="inner").sort_values("date")
+                indexed_end = pd.Timestamp(analysis_end)
+                indexed = indexed[indexed["date"] >= pd.Timestamp(analysis_start)]
+                indexed = indexed[indexed["date"] < indexed_end + pd.Timedelta(days=1) if indexed_end == indexed_end.normalize() else indexed["date"] <= indexed_end]
+                if len(indexed) >= 2 and (indexed[["x_level", "y_level"]] > 0).all().all():
+                    x0, y0 = float(indexed["x_level"].iloc[0]), float(indexed["y_level"].iloc[0])
+                    if x0 > 0 and y0 > 0:
+                        indexed_fig = go.Figure()
+                        indexed_fig.add_trace(go.Scatter(x=indexed["date"], y=indexed["x_level"] / x0 * 100.0, mode="lines", name=pair_x_label))
+                        indexed_fig.add_trace(go.Scatter(x=indexed["date"], y=indexed["y_level"] / y0 * 100.0, mode="lines", name=pair_y_label))
+                        indexed_fig.update_layout(title="Indexed levels · both start at 100", xaxis_title="Date", yaxis_title="Indexed value", height=300, margin={"l": 55, "r": 20, "t": 55, "b": 45}, paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", font={"color": "#D9E2F0", "size": 11}, legend={"orientation": "h", "y": 1.12})
+                        indexed_fig.update_xaxes(gridcolor="rgba(154, 167, 186, 0.16)")
+                        indexed_fig.update_yaxes(gridcolor="rgba(154, 167, 186, 0.16)")
+                        st.plotly_chart(indexed_fig, use_container_width=True, theme=None, config={"displaylogo": False})
                 if len(paired) >= 2:
                     x, y = paired["primary_change"], paired["comparison_change"]
                     scatter = go.Figure()
@@ -912,7 +978,7 @@ def main() -> None:
                         if slope is not None and intercept is not None:
                             xline = np.linspace(float(np.min(x)), float(np.max(x)), 80)
                             scatter.add_trace(go.Scatter(x=xline, y=intercept + slope * xline, mode="lines", name="Linear fit", line={"color": "#F59E0B", "width": 2}))
-                    change_unit = "percentage change (%)" if transform == "pct" else "absolute change"
+                    change_unit = "z-score (study-period σ)" if transform.startswith("z") else ("log return (%)" if transform == "log" else ("percentage change (%)" if transform == "pct" else "absolute change (native units)"))
                     scatter.update_layout(
                         title=f"Same-period changes · {window}-observation window · one point per matched date",
                         height=420, margin={"l": 65, "r": 25, "t": 60, "b": 75},
@@ -943,31 +1009,10 @@ def main() -> None:
                         st.dataframe(outlier_view, use_container_width=True, hide_index=True)
                         st.caption("These are the 10 most unusual paired points by a median/MAD-based deviation score. They are flagged for inspection, not automatically removed or classified as data errors. Review the dates and raw observations before deciding how they should be handled.")
 
-                    if result["pearson"] is not None:
-                        magnitude = abs(float(result["pearson"]))
-                        if magnitude < 0.20:
-                            magnitude_text = "very weak linear association by a rough magnitude convention"
-                        elif magnitude < 0.40:
-                            magnitude_text = "weak-to-modest linear association by a rough magnitude convention"
-                        elif magnitude < 0.60:
-                            magnitude_text = "moderate linear association by a rough magnitude convention"
-                        elif magnitude < 0.80:
-                            magnitude_text = "strong linear association by a rough magnitude convention"
-                        else:
-                            magnitude_text = "very strong linear association by a rough magnitude convention"
-                        sign_text = "positive" if result["pearson"] > 0 else "negative" if result["pearson"] < 0 else "zero"
-                        st.markdown(f"**Descriptive reading:** the observed Pearson association is {sign_text} and {magnitude_text}. These magnitude labels are only rules of thumb; they are not a universal pass/fail threshold and do not say whether the relationship is economically useful.")
                     if result["pearson"] is None:
-                        st.info("Pearson correlation is unavailable because one series has no variation or too few matched values.")
-                    elif result["observations"] < 30:
-                        st.warning(f"Only {result['observations']} matched observations: treat the estimated relationship as tentative.")
-                    elif result.get("pearson_ci_low") is not None and result["pearson_ci_low"] <= 0 <= result["pearson_ci_high"]:
-                        st.info("The approximate autocorrelation-adjusted interval for Pearson correlation includes zero. The estimate does not clearly distinguish this sample's linear association from zero; this does not prove the relationship is absent.")
-                    elif result.get("pearson_ci_low") is not None:
-                        st.info("The approximate autocorrelation-adjusted interval does not include zero in this sample. This is still exploratory: the adjustment is approximate and does not correct for outliers, non-stationarity, or selection across many variable pairs.")
-                    else:
-                        st.warning("A correlation interval is not shown because the estimated effective sample size is too small for a useful Fisher interval after discounting serial dependence. The raw correlation remains descriptive only.")
-                    st.caption("The approximate 95% interval uses Fisher's transformation with a Bartlett-style effective sample size based on autocorrelation across several lags, including more lags for overlapping multi-observation changes where sample support permits. This is a rough dependence adjustment, not a complete time-series inferential procedure; the interval is not adjusted for selecting many variable pairs.")
+                        st.info("Correlation unavailable: no variation or too few matched changes.")
+                    elif diagnostic["status"] == "GREY":
+                        st.info("Insufficient effective sample support for a status classification.")
 
                     rolling = rolling_pair_correlation(
                         available[pair_x_label], available[pair_y_label], int(window), transform,
@@ -1201,7 +1246,7 @@ def main() -> None:
                 with lcols[0]:
                     window = st.select_slider("Change-formation window", options=[1, 3, 5, 10, 20, 60], value=5, format_func=lambda n: f"{n} observations", key="lag_window_v17", help="Each variable's change is calculated over this many observations before matching dates.")
                 with lcols[1]:
-                    transform_label = st.selectbox("Change measure", ["Percentage change", "Absolute change"], index=0, key="lag_transform_v17")
+                    transform_label = st.selectbox("Common comparison scale", list(STATISTICAL_CHANGE_MODES), index=0, key="lag_transform_v18", help="Returns standardize price-unit differences; z-score modes put each series on a study-period standard-deviation scale.")
                 with lcols[2]:
                     max_lag = st.select_slider("Test offsets up to", options=[1, 2, 3, 5, 10], value=5, format_func=lambda n: f"±{n} windows ({n * window} observations)", key="lag_max_v17", help="Lags are spaced by a full change window, reducing overlap between the compared change intervals.")
                 st.caption(f"Reference variable: {lag_source_label}. Each comparison is tested separately at offsets spaced by {window} observations. A negative offset means the comparison series is earlier relative to the reference under the displayed alignment convention; it is not a guaranteed calendar-day lead.")
@@ -1212,7 +1257,7 @@ def main() -> None:
                     for compared in lag_targets:
                         result = lead_lag_statistics(
                             lag_source, available[compared], int(window),
-                            "pct" if transform_label == "Percentage change" else "diff",
+                            STATISTICAL_CHANGE_MODES[transform_label],
                             int(max_lag), analysis_start, analysis_end,
                         ).copy()
                         result.insert(0, "comparison_variable", compared)
@@ -1225,13 +1270,23 @@ def main() -> None:
                             peak = usable.loc[usable["correlation"].abs().idxmax()]
                             raw_p = peak.get("familywise_adjusted_p_value")
                             across_p = peak.get("adjusted_p_across_variables")
+                            ci_low_peak, ci_high_peak = peak.get("ci_low"), peak.get("ci_high")
+                            peak_r = float(peak["correlation"])
+                            peak_n = int(peak["observations"])
+                            ci_available = ci_low_peak is not None and ci_high_peak is not None and pd.notna(ci_low_peak) and pd.notna(ci_high_peak)
+                            ci_supports = ci_available and (float(ci_low_peak) > 0 or float(ci_high_peak) < 0)
+                            passes = abs(peak_r) >= 0.30 and ci_supports and across_p is not None and pd.notna(across_p) and float(across_p) <= 0.05 and peak_n >= 60
+                            status = "GREEN" if passes else ("GREY" if peak_n < 60 or not ci_available or across_p is None or pd.isna(across_p) else "RED")
                             summary_records.append({
+                                "Status": status,
                                 "Comparison variable": compared,
-                                "Peak absolute correlation": float(peak["correlation"]),
+                                "Peak |r|": abs(peak_r),
+                                "Pearson r": peak_r,
                                 "Offset (observations)": int(peak["lag_observations"]),
-                                "Within-variable adjusted p": raw_p,
-                                "Across-variable adjusted p": across_p,
-                                "Matched pairs at peak": int(peak["observations"]),
+                                "Approx. offset (minutes)": peak.get("lag_minutes_approx"),
+                                "95% bootstrap CI": f"[{float(ci_low_peak):.3f}, {float(ci_high_peak):.3f}]" if ci_low_peak is not None and ci_high_peak is not None and pd.notna(ci_low_peak) and pd.notna(ci_high_peak) else "N/A",
+                                "Adjusted p across variables": across_p,
+                                "Matched pairs at peak": peak_n,
                             })
                 all_lags = pd.concat(lag_table_parts, ignore_index=True) if lag_table_parts else pd.DataFrame()
                 if all_lags.empty:
@@ -1251,9 +1306,9 @@ def main() -> None:
                                 "visible": True,
                             },
                             customdata=np.column_stack([
-                                result["observations"], result["adjusted_p_across_variables"], result["familywise_adjusted_p_value"]
+                                result["observations"], result["adjusted_p_across_variables"], result["familywise_adjusted_p_value"], result["lag_minutes_approx"]
                             ]),
-                            hovertemplate=f"Variable: {compared}<br>Offset: %{{x}} matched observations<br>Correlation: %{{y:.3f}}<br>Matched pairs: %{{customdata[0]}}<br>Adjusted p within variable: %{{customdata[2]:.3f}}<br>Adjusted p across selected variables: %{{customdata[1]:.3f}}<extra></extra>",
+                            hovertemplate=f"Variable: {compared}<br>Offset: %{{x}} matched observations<br>Approx. elapsed time: %{{customdata[3]:.1f}} min<br>Correlation: %{{y:.3f}}<br>Matched pairs: %{{customdata[0]}}<br>Adjusted p within variable: %{{customdata[2]:.3f}}<br>Adjusted p across selected variables: %{{customdata[1]:.3f}}<extra></extra>",
                         ))
                     lag_fig.add_vline(x=0, line_dash="dash", line_color="#F59E0B")
                     lag_fig.add_hline(y=0, line_dash="dot", line_color="#94A3B8")
@@ -1270,7 +1325,7 @@ def main() -> None:
                             y_range = [max(-1, lo - pad), min(1, hi + pad)]
                     lag_fig.update_layout(
                         title=f"Lead/lag association · {window}-observation changes · {len(lag_targets)} comparison variable(s)",
-                        xaxis_title="Comparison-series offset in matched observations",
+                        xaxis_title="Offset in matched observations (hover/table gives approximate elapsed minutes)",
                         yaxis_title="Pearson correlation", yaxis={"range": y_range}, height=460,
                         margin={"l": 60, "r": 25, "t": 65, "b": 80},
                         paper_bgcolor="#0E1117", plot_bgcolor="#0E1117", font={"color": "#D9E2F0", "size": 11},
@@ -1280,22 +1335,30 @@ def main() -> None:
                     lag_fig.update_yaxes(gridcolor="rgba(154, 167, 186, 0.16)")
                     st.plotly_chart(lag_fig, use_container_width=True, theme=None, config={"displaylogo": False})
                     if summary_records:
-                        st.markdown("**Strongest tested offset for each comparison**")
-                        st.dataframe(pd.DataFrame(summary_records).sort_values("Across-variable adjusted p", na_position="last"), use_container_width=True, hide_index=True)
-                    display_lags = all_lags[["comparison_variable", "lag_observations", "correlation", "ci_low", "ci_high", "observations", "familywise_adjusted_p_value", "adjusted_p_across_variables"]].rename(columns={
+                        st.markdown("**Peak-lag diagnostics**")
+                        st.dataframe(pd.DataFrame(summary_records).sort_values("Adjusted p across variables", na_position="last"), use_container_width=True, hide_index=True)
+                        if any(row["Status"] == "GREEN" for row in summary_records):
+                            st.success("GREEN · at least one peak passed the magnitude, interval, sample and adjusted-p gates.")
+                        elif any(row["Status"] == "RED" for row in summary_records):
+                            st.error("RED · tested peaks did not pass all evidence gates.")
+                        else:
+                            st.info("GREY · insufficient matched observations or bootstrap evidence to classify the tested peaks.")
+                    display_lags = all_lags[["comparison_variable", "lag_observations", "lag_minutes_approx", "correlation", "ci_low", "ci_high", "observations", "familywise_adjusted_p_value", "adjusted_p_across_variables"]].rename(columns={
                         "comparison_variable": "Comparison variable", "lag_observations": "Offset (matched observations)",
-                        "correlation": "Pearson r", "ci_low": "Block-bootstrap 2.5%", "ci_high": "Block-bootstrap 97.5%",
+                        "lag_minutes_approx": "Approx. elapsed minutes", "correlation": "Pearson r", "ci_low": "Block-bootstrap 2.5%", "ci_high": "Block-bootstrap 97.5%",
                         "observations": "Matched pairs", "familywise_adjusted_p_value": "Adjusted p within variable",
                         "adjusted_p_across_variables": "Adjusted p across variables",
                     })
                     with st.expander("All tested offsets and uncertainty", expanded=False):
                         st.dataframe(display_lags, use_container_width=True, hide_index=True)
-                    st.caption("Within-variable adjusted p-values account for searching tested offsets for that pair using the circular-shift max-statistic. The across-variable column applies a conservative Bonferroni adjustment to those pair-level results for the number of selected comparisons. Validity still depends on the method's time-series assumptions; this is association testing, not causation or a guaranteed trading signal.")
+                    st.caption("GREEN: |r| ≥ 0.30, 95% moving-block-bootstrap CI excludes zero, adjusted p ≤ 0.05 and ≥60 matched pairs. Lag duration is approximate: offset observations × median interval between matched timestamps. Same-time alignment and stationarity still matter; association is not causation.")
 
     with data_tab:
         chosen = st.selectbox("Show observations for", list(available), key="raw_series_selection")
         raw = available[chosen].copy()
-        raw = raw[(raw["date"] >= pd.Timestamp(chart_start)) & (raw["date"] <= pd.Timestamp(chart_end))]
+        raw_end = pd.Timestamp(chart_end)
+        raw = raw[raw["date"] >= pd.Timestamp(chart_start)]
+        raw = raw[raw["date"] < raw_end + pd.Timedelta(days=1) if raw_end == raw_end.normalize() else raw["date"] <= raw_end]
         st.dataframe(raw, use_container_width=True, hide_index=True)
         st.download_button("Download these observations (CSV)", data=raw.to_csv(index=False).encode("utf-8"), file_name="trendanalysis_observations.csv", mime="text/csv")
 

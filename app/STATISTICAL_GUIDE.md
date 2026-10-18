@@ -30,18 +30,43 @@ Plain-language descriptions are rule-based and descriptive. Fewer than 30 observ
 
 ## Relationships
 
-Changes are calculated first, then paired on exact matching observation dates. Matched counts can differ by pair.
+Relationship calculations first intersect the two raw series on exact timestamps, then form changes on that matched observation grid. This avoids comparing changes formed over unequal observation spans when either series has missing bars. It does not automatically resample mismatched markets; exact timestamps and compatible sampling cadence are still required.
 
-- **Pearson r:** linear association between two sets of changes, from −1 to +1. Negative means opposite-direction linear association; positive means same-direction linear association; near zero means little linear association. It is not a probability and does not establish cause.
-- **Spearman rho:** association between ranks; useful for monotonic relationships that are not strictly linear.
-- **OLS slope:** estimated average change in the Y-variable's measured change for a one-unit change in X's measured change. Its magnitude depends on the units and transformation.
-- **Scatter plot:** each point is a matched date; the line is a simple linear fit. Inspect outliers and curved patterns.
-- **Correlation heatmap:** Pearson correlations for selected pairs. Short two-line axis labels are used for space; hover a cell to see its full series name and matched count.
-- **Rolling correlation:** repeats the correlation over a moving window. Its interval uses a Fisher transformation with a Bartlett-style effective sample size that discounts some autocorrelation between the two change series. This is an approximation, not a complete dependence correction. Adjacent rolling windows overlap heavily, so pointwise bands are not simultaneous bands; non-stationarity and small windows can still mislead. Sign changes can reflect true instability or sampling noise.
+### Common comparison scales
 
-A rough magnitude convention may describe absolute Pearson values below 0.2 as very weak, 0.2–0.4 weak-to-modest, 0.4–0.6 moderate, 0.6–0.8 strong, and above 0.8 very strong. These are **not** universal thresholds, significance cutoffs or usefulness scores. Economic relevance and reliability require separate judgement and validation.
+- **Log return (%):** `100 × ln(Pₜ / Pₜ₋W)`. Default for positive price series. It is scale-free and symmetric for rises/falls of similar proportional size. Zero or negative prices are excluded.
+- **Z-score of log return:** each log return is centered and divided by its study-period standard deviation; axes are in standard-deviation units.
+- **Percentage change (%):** `100 × (Pₜ / Pₜ₋W − 1)`. Requires a positive prior value.
+- **Z-score of percentage change:** percentage changes standardized to study-period standard deviations.
+- **Absolute change:** `Xₜ − Xₜ₋W`. Valid for signed values but remains in native units, so slopes are not comparable across different units.
+- **Z-score of absolute change:** absolute changes standardized within the study period. Useful for comparing unusual movement size across series, but does not turn the result into a causal or predictive relationship.
 
-The full-sample Pearson interval uses Fisher's transformation with a Bartlett-style effective sample size estimated from autocorrelation at several short lags. This discounts some serial dependence, but it is only approximate: it does not fully handle non-stationarity, overlapping multi-observation changes, outliers, all forms of heteroskedasticity, or selecting among many variable pairs. Treat intervals as exploratory rather than final significance tests.
+The optional indexed-level chart rebases each positive series to 100 at the first matched timestamp. It compares relative path, not statistical significance. Z-scoring changes the units of plotted movements; Pearson and Spearman correlation are invariant to positive linear rescaling.
+
+### Correlation strength and GREEN/RED status
+
+Conventional Cohen-style magnitude bands for absolute Pearson correlation are:
+
+| Absolute Pearson r | Strength |
+|---:|---|
+| `< 0.10` | Negligible |
+| `0.10–0.29` | Small |
+| `0.30–0.49` | Moderate |
+| `≥ 0.50` | Large |
+
+These are broad conventions, not universal scientific cutoffs. A stronger relationship is not automatically economically useful.
+
+- **GREEN:** `|r| ≥ 0.30`, approximate 95% interval excludes zero, Bonferroni-adjusted Fisher-z p-value `≤ 0.05`, at least 60 matched observations, and effective sample size `≥ 30`.
+- **RED:** enough data to evaluate the relationship, but one or more strength/significance gates fail.
+- **GREY:** insufficient observations or an interval/p-value cannot be estimated responsibly.
+
+The app adjusts the selected pair's approximate p-value for the number of possible pairs in the loaded workspace. The interval and p-value use a Fisher-z approximation and Bartlett-style effective sample size that discounts some serial dependence. This is not a full heteroskedasticity/autocorrelation-consistent test and does not fix non-stationarity, outliers, or data-source mismatch. Treat GREEN as evidence under the displayed assumptions, not as a buy/sell signal.
+
+- **Pearson r:** linear association between changes, from −1 to +1.
+- **Spearman rho:** rank-based monotonic association.
+- **OLS slope:** depends on the chosen transformation and units; the correlation is usually the better cross-variable comparison statistic.
+- **Rolling correlation:** repeats the correlation within a moving window. The approximate intervals are pointwise, not simultaneous, and adjacent windows overlap heavily.
+- **Correlation heatmap:** each pair uses its own exact matched timestamp grid. Hover for matched observation count; heatmap colors are descriptive and do not denote significance.
 
 ## Event response
 
@@ -56,7 +81,7 @@ The added difference graph focuses on the quantity of interest: event response m
 
 ## Lead/lag
 
-The graph aligns measured changes at multiple offsets. Negative lag means the comparison series is aligned earlier than the main variable under this app's convention; positive means later. Offsets count exact matched observations, not necessarily calendar days or a guaranteed number of trading sessions.
+The graph aligns measured changes at multiple offsets. Negative lag means the comparison series is aligned earlier than the reference under this app's convention; positive means the comparison series is later. Offsets count exact matched observations. The UI also reports an approximate elapsed time, calculated as offset observations multiplied by the median interval between matched timestamps; missing bars and session gaps can make this approximate rather than exact.
 
 For a selected change window of W observations, the app tests offsets spaced by W observations (for example, W=5 tests −10, −5, 0, +5, +10 when testing two windows in either direction). This reduces direct overlap between adjacent change windows, but it cannot eliminate serial dependence, regime changes, or timing irregularities in data with different frequencies or missing dates. The displayed offset and window length must be read together.
 
@@ -74,7 +99,7 @@ Do not label a result good or bad from one coefficient. Inspect:
 4. **Stability:** does the relationship persist across dates and regimes?
 5. **Incremental value:** does it add information over an appropriate ordinary-response baseline?
 
-The current UI is exploratory. The lead/lag plot now uses non-overlapping tested offsets, moving-block-bootstrap intervals, and a circular-shift maximum-statistic p-value adjusted across the tested lags. Pair/rolling intervals use an approximate autocorrelation-based effective sample size; event-response differences use moving-block bootstrap intervals. None of these methods corrects all forms of dependence or all the other analyst choices. Cross-variable searches, repeated threshold/horizon tuning and chart interpretation still require pre-specified hypotheses, explicit multiple-testing control and confirmation on untouched chronological data before strong claims of statistical significance, causality or trading usefulness are justified.
+The current UI is exploratory. Lead/lag uses non-overlapping tested offsets, moving-block-bootstrap intervals and circular-shift max-statistic p-values adjusted over tested offsets, then conservatively adjusted across selected comparison variables. Same-period relationship p-values and intervals use the approximate effective-sample-size method described above. Event-response differences use moving-block bootstrap intervals. None of these methods corrects every form of dependence or all analyst choices; confirm candidate results on a pre-specified untouched chronological period before making claims of predictive or trading value.
 
 
 ## Multiple variables in event and lead/lag analyses

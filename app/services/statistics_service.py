@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from math import atanh, tanh, sqrt
+from math import atanh, tanh, sqrt, erfc
 from typing import Iterable, Mapping
 
 import numpy as np
@@ -23,30 +23,83 @@ def normalize_series(frame: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
 
 
-def change_series(frame: pd.DataFrame, window: int = 1, mode: str = "pct") -> pd.DataFrame:
+STATISTICAL_CHANGE_MODES = {
+    "Log return (%)": "log",
+    "Z-score of log return": "zlog",
+    "Percentage change (%)": "pct",
+    "Z-score of percentage change": "zpct",
+    "Absolute change": "diff",
+    "Z-score of absolute change": "zdiff",
+}
+
+
+def _change_values(values: pd.Series, window: int, mode: str) -> pd.Series:
+    """Calculate one variable's change series on the supplied observation grid."""
+    prior = values.shift(window)
+    if mode == "pct":
+        result = (values / prior - 1.0) * 100.0
+        result = result.where(prior > 0)
+    elif mode == "log":
+        valid = (values > 0) & (prior > 0)
+        result = pd.Series(np.nan, index=values.index, dtype=float)
+        result.loc[valid] = np.log(values.loc[valid] / prior.loc[valid]) * 100.0
+    elif mode == "diff":
+        result = values.diff(window)
+    else:
+        raise ValueError("Unsupported base change mode")
+    return result.replace([np.inf, -np.inf], np.nan)
+
+
+def change_series(
+    frame: pd.DataFrame,
+    window: int = 1,
+    mode: str = "pct",
+    standardize_start_date=None,
+    standardize_end_date=None,
+) -> pd.DataFrame:
+    """Calculate changes; z-score modes scale using the selected study period.
+
+    For pair analyses, raw prices are timestamp-matched before this function's
+    equivalent transform is applied, so both returns span the same matched grid.
+    """
     if window < 1:
         raise ValueError("window must be >= 1")
     out = normalize_series(frame)
     if out.empty:
         out["change"] = pd.Series(dtype="float64")
         return out[["date", "change"]]
-    if mode == "pct":
-        prior = out["value"].shift(window)
-        out["change"] = (out["value"] / prior - 1.0) * 100.0
-        out.loc[prior <= 0, "change"] = np.nan
-    elif mode == "diff":
-        out["change"] = out["value"].diff(window)
-    else:
-        raise ValueError("mode must be 'pct' or 'diff'")
+    standardized = mode.startswith("z")
+    base_mode = mode[1:] if standardized else mode
+    if base_mode not in {"pct", "log", "diff"}:
+        raise ValueError("mode must be one of pct, log, diff, zpct, zlog, zdiff")
+    out["change"] = _change_values(out["value"], window, base_mode)
+    if standardized:
+        reference = out["change"].copy()
+        if standardize_start_date is not None:
+            reference = reference[out["date"] >= pd.Timestamp(standardize_start_date)]
+        if standardize_end_date is not None:
+            end = pd.Timestamp(standardize_end_date)
+            reference = reference[out["date"] < end + pd.Timedelta(days=1)] if end == end.normalize() else reference[out["date"] <= end]
+        mean = float(reference.mean()) if reference.notna().any() else np.nan
+        std = float(reference.std(ddof=1)) if reference.notna().sum() >= 2 else np.nan
+        if np.isfinite(std) and std > 0:
+            out["change"] = (out["change"] - mean) / std
+        else:
+            out["change"] = np.nan
     return out[["date", "change"]].replace([np.inf, -np.inf], np.nan)
 
 
 def _date_filter(frame: pd.DataFrame, start_date=None, end_date=None) -> pd.DataFrame:
+    """Filter by inclusive calendar dates, retaining all intraday bars on end_date."""
     out = frame.copy()
     if start_date is not None:
         out = out[out["date"] >= pd.Timestamp(start_date)]
     if end_date is not None:
-        out = out[out["date"] <= pd.Timestamp(end_date)]
+        end = pd.Timestamp(end_date)
+        if end == end.normalize():
+            out = out[out["date"] < end + pd.Timedelta(days=1)]
+        else:
+            out = out[out["date"] <= end]
     return out
 
 
@@ -58,12 +111,44 @@ def paired_change_data(
     start_date=None,
     end_date=None,
 ) -> pd.DataFrame:
-    """Matched-date changes for scatter/relationship plots; exact dates only."""
-    p = change_series(primary, window, mode).rename(columns={"change": "primary_change"})
-    c = change_series(comparison, window, mode).rename(columns={"change": "comparison_change"})
-    joined = p.merge(c, on="date", how="inner")
-    joined = joined.dropna(subset=["primary_change", "comparison_change"])
-    return _date_filter(joined, start_date, end_date).reset_index(drop=True)
+    """Align raw levels on exact timestamps, then calculate both changes on that grid.
+
+    Calculating returns before alignment can compare unequal elapsed intervals when one
+    series has missing bars. This function deliberately intersects timestamps first.
+    """
+    p = normalize_series(primary).rename(columns={"value": "primary_value"})
+    c = normalize_series(comparison).rename(columns={"value": "comparison_value"})
+    joined = p.merge(c, on="date", how="inner").sort_values("date").reset_index(drop=True)
+    joined = _date_filter(joined, start_date, end_date)
+    # Keep the prior matched observation available for the first selected return.
+    if start_date is not None:
+        raw_all = normalize_series(primary).rename(columns={"value": "primary_value"}).merge(
+            normalize_series(comparison).rename(columns={"value": "comparison_value"}), on="date", how="inner"
+        ).sort_values("date").reset_index(drop=True)
+        cutoff = pd.Timestamp(start_date)
+        before = raw_all[raw_all["date"] < cutoff].tail(window)
+        joined = pd.concat([before, joined], ignore_index=True).drop_duplicates("date", keep="last").sort_values("date").reset_index(drop=True)
+    standardized = mode.startswith("z")
+    base_mode = mode[1:] if standardized else mode
+    if base_mode not in {"pct", "log", "diff"}:
+        raise ValueError("mode must be one of pct, log, diff, zpct, zlog, zdiff")
+    joined["primary_change"] = _change_values(joined["primary_value"], window, base_mode)
+    joined["comparison_change"] = _change_values(joined["comparison_value"], window, base_mode)
+    # Standardization is estimated only inside the chosen study dates, separately for
+    # each series. This gives both scatter axes unitless, comparable sigma units.
+    if standardized:
+        for column in ("primary_change", "comparison_change"):
+            reference = joined[column].copy()
+            if start_date is not None:
+                reference = reference[joined["date"] >= pd.Timestamp(start_date)]
+            if end_date is not None:
+                end = pd.Timestamp(end_date)
+                reference = reference[joined["date"] < end + pd.Timedelta(days=1)] if end == end.normalize() else reference[joined["date"] <= end]
+            mean = float(reference.mean()) if reference.notna().any() else np.nan
+            std = float(reference.std(ddof=1)) if reference.notna().sum() >= 2 else np.nan
+            joined[column] = (joined[column] - mean) / std if np.isfinite(std) and std > 0 else np.nan
+    joined = _date_filter(joined, start_date, end_date)
+    return joined.dropna(subset=["primary_change", "comparison_change"])[["date", "primary_change", "comparison_change"]].reset_index(drop=True)
 
 
 def _fisher_correlation_interval(r: float | None, n: float) -> tuple[float | None, float | None]:
@@ -150,6 +235,14 @@ def pair_statistics(
     slope = float(np.polyfit(x, y, 1)[0]) if np.std(x) > 0 else None
     effective_n = effective_sample_size_for_correlation(x, y, max_acf_lag=min(max(10, window - 1), n // 4))
     ci_low, ci_high = _fisher_correlation_interval(pearson, effective_n)
+    # Approximate two-sided Fisher-z p-value using the same effective-n estimate as
+    # the interval. It is explicitly approximate for dependent financial observations.
+    p_value = None
+    if pearson is not None and effective_n > 3 and abs(pearson) < 1:
+        fisher_z = abs(atanh(float(pearson))) * sqrt(max(effective_n - 3.0, 0.0))
+        p_value = float(erfc(fisher_z / sqrt(2.0)))
+    elif pearson is not None and abs(pearson) >= 1 and effective_n > 3:
+        p_value = 0.0
     return {
         "observations": n,
         "effective_observations": effective_n,
@@ -158,6 +251,66 @@ def pair_statistics(
         "slope": slope if slope is None or np.isfinite(slope) else None,
         "pearson_ci_low": ci_low,
         "pearson_ci_high": ci_high,
+        "approx_p_value": p_value,
+    }
+
+
+def correlation_strength(correlation: float | None) -> str:
+    """Cohen-style conventional magnitude labels; these are not universal cutoffs."""
+    if correlation is None or not np.isfinite(correlation):
+        return "N/A"
+    magnitude = abs(float(correlation))
+    if magnitude < 0.10:
+        return "Negligible"
+    if magnitude < 0.30:
+        return "Small"
+    if magnitude < 0.50:
+        return "Moderate"
+    return "Large"
+
+
+def relationship_diagnostic(
+    stats: Mapping[str, float | int | None],
+    family_size: int = 1,
+    alpha: float = 0.05,
+    minimum_abs_correlation: float = 0.30,
+    minimum_observations: int = 60,
+    minimum_effective_observations: float = 30.0,
+) -> dict[str, float | int | str | None]:
+    """Classify pair evidence using magnitude, uncertainty, support and multiplicity.
+
+    GREEN is deliberately strict: medium-or-larger effect (|r| >= .30), approximate
+    95% interval excluding zero, and Bonferroni-adjusted Fisher-z p <= alpha, with
+    at least 60 matched observations and effective n >= 30. These are transparent
+    conservative UI gates, not universal scientific laws or trading rules.
+    """
+    r = stats.get("pearson")
+    low = stats.get("pearson_ci_low")
+    high = stats.get("pearson_ci_high")
+    p = stats.get("approx_p_value")
+    n = int(stats.get("observations") or 0)
+    n_eff = float(stats.get("effective_observations") or 0.0)
+    family = max(1, int(family_size))
+    adjusted_p = min(1.0, float(p) * family) if p is not None and np.isfinite(p) else None
+    enough_data = n >= minimum_observations and n_eff >= minimum_effective_observations
+    ci_excludes_zero = low is not None and high is not None and (float(low) > 0 or float(high) < 0)
+    practical = r is not None and np.isfinite(r) and abs(float(r)) >= minimum_abs_correlation
+    significant = adjusted_p is not None and adjusted_p <= alpha
+    if not enough_data or r is None or adjusted_p is None or low is None or high is None:
+        status = "GREY"
+    elif practical and significant and ci_excludes_zero:
+        status = "GREEN"
+    else:
+        status = "RED"
+    return {
+        "status": status,
+        "strength": correlation_strength(float(r) if r is not None else None),
+        "family_size": family,
+        "adjusted_p_value": adjusted_p,
+        "enough_data": enough_data,
+        "ci_excludes_zero": bool(ci_excludes_zero),
+        "practical_effect": bool(practical),
+        "statistically_supported": bool(significant and ci_excludes_zero),
     }
 
 def correlation_matrix(
@@ -168,25 +321,31 @@ def correlation_matrix(
     start_date=None,
     end_date=None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Return correlation matrix and a matched-observation-count matrix."""
-    changes: dict[str, pd.Series] = {}
-    for label, frame in series.items():
-        transformed = change_series(frame, window, mode).rename(columns={"change": label})
-        if start_date is not None:
-            transformed = transformed[transformed["date"] >= pd.Timestamp(start_date)]
-        if end_date is not None:
-            transformed = transformed[transformed["date"] <= pd.Timestamp(end_date)]
-        changes[label] = transformed.set_index("date")[label]
-    if not changes:
-        return pd.DataFrame(), pd.DataFrame()
-    aligned = pd.concat(changes.values(), axis=1, join="outer").sort_index()
-    corr = aligned.corr(method=method, min_periods=3)
-    counts = pd.DataFrame(index=aligned.columns, columns=aligned.columns, dtype=float)
-    for left in aligned.columns:
-        for right in aligned.columns:
-            counts.loc[left, right] = int(aligned[[left, right]].dropna().shape[0])
-    return corr, counts.astype("Int64")
+    """Return pairwise correlations after exact raw-timestamp alignment.
 
+    Each pair gets its own matched timestamp grid. It does not calculate changes on
+    each source's native grid and then accidentally compare unequal observation spans.
+    """
+    labels = list(series)
+    corr = pd.DataFrame(np.nan, index=labels, columns=labels, dtype=float)
+    counts = pd.DataFrame(0, index=labels, columns=labels, dtype="Int64")
+    for i, left in enumerate(labels):
+        for j in range(i, len(labels)):
+            right = labels[j]
+            paired = paired_change_data(series[left], series[right], window, mode, start_date, end_date)
+            x = paired["primary_change"]
+            y = paired["comparison_change"]
+            n = len(paired)
+            value = None
+            if n >= 3:
+                value = _safe_corr(x.to_numpy(dtype=float), y.to_numpy(dtype=float)) if method == "pearson" else x.corr(y, method=method)
+                if pd.isna(value):
+                    value = None
+            corr.loc[left, right] = value
+            corr.loc[right, left] = value
+            counts.loc[left, right] = n
+            counts.loc[right, left] = n
+    return corr, counts
 
 def rolling_pair_correlation(
     primary: pd.DataFrame,
@@ -357,12 +516,11 @@ def lead_lag_statistics(
         raise ValueError("max_lag must be >= 0")
     if window < 1:
         raise ValueError("window must be >= 1")
-    p = change_series(primary, window, mode).rename(columns={"change": "primary_change"})
-    c = change_series(comparison, window, mode).rename(columns={"change": "comparison_change"})
-    joined = p.merge(c, on="date", how="inner").sort_values("date").reset_index(drop=True)
-    joined = _date_filter(joined, start_date, end_date).dropna(subset=["primary_change", "comparison_change"]).reset_index(drop=True)
+    joined = paired_change_data(primary, comparison, window, mode, start_date, end_date)
     x = joined["primary_change"].to_numpy(dtype=float)
     y = joined["comparison_change"].to_numpy(dtype=float)
+    date_diffs = joined["date"].sort_values().diff().dt.total_seconds().div(60.0).dropna()
+    median_step_minutes = float(date_diffs[date_diffs > 0].median()) if (date_diffs > 0).any() else np.nan
     lag_windows = list(range(-max_lag, max_lag + 1))
     offsets = [step * window for step in lag_windows]
     boot_ci, block_length = _moving_block_lag_intervals(x, y, offsets, window, bootstrap_replicates)
@@ -374,6 +532,7 @@ def lead_lag_statistics(
         records.append({
             "lag_windows": step,
             "lag_observations": offset,
+            "lag_minutes_approx": float(offset * median_step_minutes) if np.isfinite(median_step_minutes) else None,
             "correlation": corr,
             "ci_low": ci_low,
             "ci_high": ci_high,

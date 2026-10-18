@@ -4,7 +4,7 @@ This folder adds a Streamlit/Plotly research UI over the existing repository. It
 
 ## User experience
 
-- **Add a variable:** select a plain-language data type, choose an available series, and accept its sensible default measure. The measure selector is optional.
+- **Add a variable:** select a plain-language data type, choose an available series, and accept its sensible default measure. Market prices can use either equity/global assets or MCX commodity futures OHLCV; the measure selector is optional.
 - **Compare as many series as needed:** add any number of variables. Charts are arranged side-by-side, with either two or three panels per row. Each panel has its own value axis, while the date axes are linked.
 - **Choose a chart period simply:** choose a recent number of days, weeks, months or years, or enter specific dates manually.
 - **Keep statistics simple by default:** statistical analysis uses the chart period unless the user chooses a separate study period.
@@ -72,7 +72,7 @@ This update replaces files inside `app/` only. Before extracting it over an exis
 - The workspace's **Data coverage and how each series is built** panel shows the first/latest loaded observations, row counts in the chart range, and the construction rule for each series. Recent daily series with no observations for more than five calendar days are flagged for inspection.
 - Stock/index options and commodity options are selected from raw `unified_market_master` contract rows using their own instrument-type filters. The selected ticker is used in the history query, so the chart cannot fall back to an unrelated first ticker.
 - Underlying-level options PCR is calculated per date by summing eligible CE/PE open interest (or volume) across available strikes and expiry dates for the exact selected ticker. This is not a single-strike or single-expiry options chart.
-- Stock/index futures and commodity futures are selected from raw `unified_market_master` rows. One contract is represented per date: highest open interest, with earlier expiry as tie-breaker. The expiry can change over time; basis against the recorded underlying price is only calculated when that source field is populated.
+- Stock/index futures and commodity futures are selected from raw `unified_market_master` rows. One contract is represented per date: highest open interest, with earlier expiry as tie-breaker. The expiry can change over time; basis against the recorded underlying price is only calculated when that source field is populated. MCX commodity futures also have a dedicated Market prices option exposing daily Open, High, Low, Close and Volume fields.
 - The legacy stock/index spot-futures basis view remains separate because it requires a matching cash-market row and cannot represent most commodity contracts.
 - F&O pickers first attempt an exact underlying-ticker match with the main series (ignoring `.NS` / `.BO` suffixes). If none exists, the UI asks the user to choose a traded underlying explicitly rather than selecting an unrelated ticker by default. Economic aliases such as `Brent_Crude` → `CRUDEOIL` are not silently guessed.
 - Commodity futures/options will appear only when the relevant raw contract records exist in `unified_market_master`. The app does not ingest missing MCX/commodity records; those must be supplied by the upstream ETL/data source.
@@ -153,3 +153,15 @@ Commodity futures/options are loaded directly from raw `unified_market_master` c
 ## Multi-variable Event Study and Lead/Lag (v17)
 
 Event Study now lets you select an event-defining series independently from the workspace reference and run the same event definition against multiple response targets. A target selector controls the detailed charts; the results table includes every selected target. Lead/Lag similarly lets you choose a reference series and multiple comparison series, overlay their lag curves, and inspect per-variable results. Within-variable p-values adjust over tested offsets; an additional conservative Bonferroni adjustment accounts for the number of selected comparisons. These controls do not imply causal identification.
+
+## Statistical normalization and evidence gates (v18)
+
+- Relationship and lead/lag analysis now offers log returns, percentage changes, absolute changes, and study-period z-scores. The default is log return (%) for positive price series.
+- A cross-series indexed-level chart rebases positive levels to 100 at the first matched timestamp. Inferential statistics use returns/changes, not raw price-level correlation.
+- Pair calculations intersect raw observations on exact timestamps before forming returns, so missing bars do not cause unequal native-observation spans to be compared. End dates are inclusive for intraday observations.
+- Selected-pair status is GREEN only when `|r| >= 0.30`, the approximate 95% interval excludes zero, Bonferroni-adjusted p `<= 0.05`, matched N `>= 60`, and effective N `>= 30`. RED means the data are sufficient but the evidence gates fail; GREY means the estimate cannot be classified.
+- Magnitude bands: `<0.10` negligible, `0.10–0.29` small, `0.30–0.49` moderate, `>=0.50` large. These are conventional Cohen-style ranges, not universal trading thresholds.
+- Lead/lag reports approximate elapsed minutes from matched timestamps as well as observation offsets. It remains approximate around missing bars, sessions and market holidays.
+- The pair p-value and 95% interval use a Fisher-z approximation with autocorrelation-discounted effective sample size. The lead/lag panel retains moving-block bootstrap intervals and circular-shift max-statistic tests. A green status is evidence under those assumptions, not a causal finding or trade signal.
+
+Run tests: `python -m pytest -q app/tests`.

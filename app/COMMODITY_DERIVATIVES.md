@@ -2,6 +2,12 @@
 
 The app reads commodity contracts directly from `unified_market_master`. It does not use `mv_spot_futures_basis` for MCX contracts because that legacy table joins futures to NSE cash-equity rows.
 
+## Market-price selection
+
+The **Market prices → Price universe → MCX commodities (daily OHLCV)** option loads commodity futures from `unified_market_master` using the `FUTCOM` + non-option-side filter. The chart can plot Open, High, Low, Close or Volume, and the terminal readout retains the raw OHLC values. It uses the highest-open-interest futures contract per date (earlier expiry breaks ties), so the represented expiry can roll through time. This is a stitched daily series, not an expiry-fixed contract history.
+
+The market-price source is distinct from global/equity assets because those use `global_assets_daily`; the MCX history is sourced from raw derivative rows. This option does not manufacture data if the required `FUTCOM` rows are absent. The current query is daily (`ReportDate`); intraday OHLC requires intraday bars to be ingested and exposed separately.
+
 ## Instrument classification
 
 - `FUTCOM` with `OptionType` `XX` or blank: commodity futures.
